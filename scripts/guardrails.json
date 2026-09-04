@@ -1,0 +1,26 @@
+{
+  "enabled": true,
+  "job_memory_cap_gb": 51.0,
+  "cpu_percent_cap": 75,
+  "below_normal_priority": true,
+  "watchdog_enabled": true,
+  "watchdog_interval_sec": 3.0,
+  "watchdog_strikes": 3,
+  "min_free_ram_gb": 2.5,
+  "min_free_disk_gb": 12.0,
+  "min_free_pagefile_gb": 3.0,
+  "preflight_enabled": true,
+  "disk_reserve_gb": 15.0,
+  "max_execution_threads": 4,
+  "video_memory_strategy": "moderate",
+  "temp_frame_format": "jpeg",
+  "prefer_nvenc": true,
+  "esrgan_tile": 512,
+  "nvenc_maxrate_mbps": 120,
+  "_machine": {
+    "total_ram_gb": 31.8,
+    "logical_cores": 28,
+    "vram_total_mb": 16311,
+    "commit_limit_gb": 102.1
+  }
+}

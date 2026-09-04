@@ -1,0 +1,19 @@
+# FaceFusion is a clone of an upstream repository with its own .git, plus a
+# venv and ~37 GB of model weights. It is a dependency of this project, not
+# part of it.
+/facefusion/
+
+# Renders, temp frame dumps, extracted source faces, the app log. Tens of GB,
+# all of it reproducible from the inputs.
+/output/
+
+# Source faces and target videos are personal media, and large.
+/input/
+IMG_*.jpg
+
+__pycache__/
+*.py[cod]
+
+# Hand-made snapshots taken before risky config edits. Useful locally, noise
+# in history - git is the point of having them.
+*.bak

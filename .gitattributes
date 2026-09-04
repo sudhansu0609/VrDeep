@@ -1,0 +1,9 @@
+# Every source file in this tree is LF on disk, but core.autocrlf is true on
+# this machine, so without this a fresh clone would rewrite all of them to CRLF
+# and the very first `git status` would show the whole tree as modified.
+* text=auto eol=lf
+
+# Windows refuses to run a .bat whose lines end in bare LF once the file has
+# any multi-line construct, so these two keep CRLF wherever they are checked out.
+*.bat text eol=crlf
+*.vbs text eol=crlf
