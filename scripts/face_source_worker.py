@@ -134,7 +134,8 @@ def init_facefusion(args):
                  f"Run a normal swap once so the models are fetched, then retry.")
 
 
-def decode_frames(video, width, height, sample_fps, trim_start, trim_end):
+def decode_frames(video, width, height, sample_fps, trim_start, trim_end,
+                  decode_threads=4):
     """
     Yield sampled frames one at a time.
 
@@ -145,7 +146,11 @@ def decode_frames(video, width, height, sample_fps, trim_start, trim_end):
     """
     import numpy
 
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    # One decode thread per core is ffmpeg's default, and each holds its own
+    # decoded frames - 100 MB apiece on an 8192x4096 source. Capped for the
+    # same reason as the pipeline's other decodes (see engine._decode_args).
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-threads", str(max(1, int(decode_threads)))]
     if trim_start:
         cmd += ["-ss", str(trim_start)]
     if trim_end:
@@ -452,6 +457,7 @@ def main():
                         help="Reject frames below this fraction of the clip's median sharpness.")
     parser.add_argument("--crop-margin", type=float, default=1.8)
     parser.add_argument("--max-decode-width", type=int, default=3840)
+    parser.add_argument("--decode-threads", type=int, default=4)
     parser.add_argument("--gender", default="auto", choices=["auto", "male", "female"])
     parser.add_argument("--trim-start", type=float, default=0.0)
     parser.add_argument("--trim-end", type=float, default=0.0)
@@ -509,7 +515,7 @@ def main():
     wrong_gender = 0
 
     for frame in decode_frames(args.video, decode_w, decode_h, sample_fps,
-                               args.trim_start, args.trim_end):
+                               args.trim_start, args.trim_end, args.decode_threads):
         index += 1
         if index % 5 == 0:
             emit(f"FACESRC_PROGRESS {min(index, total_expected)} {total_expected}")

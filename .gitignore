@@ -6,6 +6,8 @@
 # Renders, temp frame dumps, extracted source faces, the app log. Tens of GB,
 # all of it reproducible from the inputs.
 /output/
+/output2/
+/output5/
 
 # Source faces and target videos are personal media, and large.
 /input/
@@ -17,3 +19,7 @@ __pycache__/
 # Hand-made snapshots taken before risky config edits. Useful locally, noise
 # in history - git is the point of having them.
 *.bak
+
+# The RIFE frame-interpolation weights. 10 MB of downloadable model, not source
+# - scripts/rife_worker.py fetches them on demand (see --install-model).
+/models/

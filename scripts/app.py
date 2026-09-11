@@ -3,10 +3,11 @@ from tkinter import filedialog, messagebox, ttk
 import os
 import sys
 import gc
+import copy
 import json
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 
@@ -44,12 +45,14 @@ attach_console_log()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import guardrails
+import vr_metadata
 import upscale_vr
 import clip_selector
 from guardrails import ResourceGuard
 from engine import (
-    run_vr_pipeline, run_normal_pipeline, load_config, prepare_run,
-    split_sources, is_video_path, is_image_path,
+    run_chunked_pipeline, load_config, prepare_run, chunk_plan, chunk_dir_for, probe_video,
+    split_sources, is_video_path, is_image_path, describe_run_state,
+    vr_stage_keys, quality_to_cq,
     PROJECT_DIR, DEFAULT_CONFIG, PipelineError
 )
 
@@ -58,6 +61,248 @@ ctk.set_default_color_theme("blue")
 
 APP_WIDTH = 1200
 APP_HEIGHT = 850
+
+# ---------------------------------------------------------------------------
+# Session memory
+#
+# Every field on this window used to be empty again at the next launch, so
+# picking a stopped job back up meant re-browsing to the source, re-browsing to
+# the target and retyping the in and out points. That is not merely tedious:
+# the target file and the clip range are part of the resume key, so a start
+# time typed back as 61 where it had been 60.5 quietly invalidated a finished
+# eye and re-swapped it for an hour. Remembering the fields is what makes
+# "Resume from where the last attempt stopped" actually resume.
+#
+# It lives in output/ beside run_state.json, which is the other half of the
+# same memory: this file is what the user chose, that one is what was built.
+# ---------------------------------------------------------------------------
+
+SESSION_PATH = os.path.join(PROJECT_DIR, "output", "session.json")
+
+# ---------------------------------------------------------------------------
+# Job queue
+#
+# One run at a time is all this machine can do - a second FaceFusion would
+# fight the first for the same 16 GB of VRAM - but one run at a time is not
+# the same as one run per sitting. The queue is a list of jobs, each a frozen
+# copy of a tab's fields plus the settings in force when it was added, run in
+# order, each one no earlier than the time written against it. It lives in
+# output/queue.json so that a night's worth of jobs survives a restart.
+# ---------------------------------------------------------------------------
+
+QUEUE_PATH = os.path.join(PROJECT_DIR, "output", "queue.json")
+
+# Which tab variable each job field is read from and written back to. The
+# upscale quality slider is not a variable and is handled by hand.
+JOB_FIELD_VARS = {
+    "vr": {
+        "preset": "vr_preset_var", "source": "vr_source_var", "target": "vr_target_var",
+        "output": "vr_output_var", "layout": "vr_layout_var",
+        "trim_start": "vr_trim_start_var", "trim_end": "vr_trim_end_var",
+        "fps": "vr_fps_var", "keep_temp": "vr_keep_temp_var", "resume": "vr_resume_var",
+        "refresh_faces": "vr_refresh_faces_var",
+    },
+    "normal": {
+        "preset": "nm_preset_var", "source": "nm_source_var", "target": "nm_target_var",
+        "output": "nm_output_var",
+        "trim_start": "nm_trim_start_var", "trim_end": "nm_trim_end_var",
+        "fps": "nm_fps_var", "keep_temp": "nm_keep_temp_var",
+        "refresh_faces": "nm_refresh_faces_var",
+    },
+    "upscale": {
+        "input": "up_input_var", "output": "up_output_var",
+        "trim_start": "up_trim_start_var", "trim_end": "up_trim_end_var",
+        "target": "up_target_var", "layout": "up_layout_var", "method": "up_method_var",
+        "headset": "up_headset_var", "encoder": "up_encoder_var",
+        "split_eyes": "up_split_eyes_var", "allow_sw": "up_allow_sw_var",
+    },
+}
+
+JOB_SCHEDULE_VARS = {"vr": "vr_schedule_var", "normal": "nm_schedule_var",
+                     "upscale": "up_schedule_var"}
+JOB_TABS = {"vr": "VR Mode", "normal": "Normal Mode", "upscale": "Upscale"}
+JOB_HEADINGS = {"vr": "VR PIPELINE", "normal": "NORMAL PIPELINE", "upscale": "UPSCALE"}
+JOB_DONE_TEXT = {"vr": "VR Pipeline complete!", "normal": "Normal Pipeline complete!",
+                 "upscale": "Upscale complete!"}
+
+JOB_STATUS_COLORS = {
+    "waiting": "#60a5fa", "running": "#4ade80", "done": "#22c55e",
+    "failed": "#ef4444", "stopped": "#f59e0b", "skipped": "#888888",
+    # Amber, like "stopped": the job has not failed and has not been abandoned,
+    # it is holding for memory somebody else's program is using.
+    "deferred": "#f59e0b",
+}
+
+# Statuses that still have a run ahead of them. A deferred job is a waiting job
+# that has already been refused once for memory, so everywhere the queue asks
+# "is there anything left to do" the answer has to include it - otherwise the
+# queue reports itself finished with jobs still on the list.
+PENDING_STATUSES = ("waiting", "deferred")
+NOT_BEFORE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def job_title(job):
+    """One line that says what a job is, for the queue list and the log."""
+    f = job["fields"]
+    if job["kind"] == "upscale":
+        return (f"Upscale to {f.get('target', '')}: "
+                f"{os.path.basename(f.get('input', '')) or '(no input)'}")
+    what = "VR swap" if job["kind"] == "vr" else "2D swap"
+    return f"{what}: {os.path.basename(f.get('target', '')) or '(no target)'}"
+
+
+def job_detail(job):
+    """The second line: the portion, the output name, and what happened to it."""
+    f = job["fields"]
+    start = clip_selector.parse_timecode(f.get("trim_start") or "")
+    end = clip_selector.parse_timecode(f.get("trim_end") or "")
+    if start is None and end is None:
+        portion = "whole video"
+    else:
+        portion = (f"{clip_selector.format_timecode(start) if start is not None else 'start'}"
+                   f" to {clip_selector.format_timecode(end) if end is not None else 'end'}")
+    bits = [portion]
+    if job["kind"] != "upscale" and f.get("preset"):
+        bits.append(f.get("preset").split(" (")[0])
+    bits.append("-> " + (os.path.basename(f.get("output", "")) or "(no output)"))
+    if job.get("elapsed"):
+        bits.append(guardrails.fmt_duration(job["elapsed"]))
+    if job.get("note"):
+        bits.append(job["note"])
+    return "  |  ".join(bits)
+
+
+def job_not_before(job):
+    text = job.get("not_before")
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, NOT_BEFORE_FMT)
+    except ValueError:
+        return None
+
+
+def _job_time(job, key):
+    """One of the job's datetime strings, or None when absent or unreadable.
+
+    Absent is the normal case for a queue.json written before deferral
+    existed, so it is not worth a complaint - a job with no retry time is a
+    job that has never been deferred.
+    """
+    text = job.get(key)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, NOT_BEFORE_FMT)
+    except (TypeError, ValueError):
+        return None
+
+
+def job_retry_after(job):
+    """When a deferred job may be tried again, or None."""
+    return _job_time(job, "retry_after")
+
+
+def job_ready_at(job):
+    """
+    The earliest this job may start: its scheduled time, or its retry time.
+
+    A deferred job keeps whatever start time it was given - a 02:00 job that
+    defers at 02:00 must not become eligible at 01:55 on the next tick - so the
+    later of the two is what the queue waits for.
+    """
+    when = job_not_before(job)
+    if job.get("status") == "deferred":
+        retry = job_retry_after(job)
+        if retry is not None and (when is None or retry > when):
+            return retry
+    return when
+
+# What the "Start At" boxes accept. Written out rather than left to a docstring
+# because it is also the hint shown under the box.
+SCHEDULE_HINT = "empty = start now  |  02:30  |  tomorrow 02:30  |  +90m  |  +2h30m"
+
+
+def parse_schedule_time(text, now=None):
+    """
+    "02:30" / "tomorrow 02:30" / "+90m" / "+2h30m" / "2026-09-06 02:30" -> datetime.
+
+    None for an empty box. Raises ValueError, with a sentence worth showing, for
+    anything else. A bare clock time that has already gone today means tomorrow:
+    someone typing 02:30 at midnight means tonight, and someone typing it at
+    03:00 means the next one.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    now = now or datetime.now()
+
+    if text.startswith("+"):
+        rest = text[1:].strip().lower().replace(" ", "")
+        if not rest:
+            raise ValueError("'+' needs a length after it, like +90m or +2h30m.")
+        minutes, number, seen = 0.0, "", False
+        for char in rest:
+            if char.isdigit() or char == ".":
+                number += char
+            elif char in "hm":
+                if not number:
+                    raise ValueError(f"'{text}' has a '{char}' with no number before it.")
+                minutes += float(number) * (60 if char == "h" else 1)
+                number, seen = "", True
+            else:
+                raise ValueError(f"'{text}' is not a length - use +90m or +2h30m.")
+        if number:
+            # A bare "+45" is minutes, which is what anyone typing it means.
+            minutes += float(number)
+        elif not seen:
+            raise ValueError(f"'{text}' is not a length - use +90m or +2h30m.")
+        if minutes <= 0:
+            raise ValueError("A scheduled start has to be in the future.")
+        return now + timedelta(minutes=minutes)
+
+    tomorrow = False
+    lowered = text.lower()
+    for word in ("tomorrow", "tmr"):
+        if lowered.startswith(word):
+            tomorrow = True
+            text = text[len(word):].strip()
+            break
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            clock = datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+        when = now.replace(hour=clock.hour, minute=clock.minute,
+                           second=clock.second, microsecond=0)
+        if tomorrow or when <= now:
+            when += timedelta(days=1)
+        return when
+
+    raise ValueError(f"'{text}' is not a time. Use {SCHEDULE_HINT}.")
+
+# Deliberately excludes vr/nm_refresh_faces_var. Re-extract is a one-shot that
+# the end of every run already clears, and remembering it would re-run the
+# source analysis on every launch - exactly the cost the extraction cache
+# exists to avoid.
+SESSION_VARS = (
+    "vr_preset_var", "vr_source_var", "vr_target_var", "vr_layout_var",
+    "vr_output_var", "vr_trim_start_var", "vr_trim_end_var", "vr_fps_var",
+    "vr_keep_temp_var", "vr_resume_var", "vr_schedule_var",
+    "nm_preset_var", "nm_source_var", "nm_target_var", "nm_output_var",
+    "nm_trim_start_var", "nm_trim_end_var", "nm_fps_var", "nm_keep_temp_var",
+    "nm_schedule_var",
+    "up_input_var", "up_output_var", "up_trim_start_var", "up_trim_end_var",
+    "up_target_var", "up_layout_var", "up_method_var", "up_headset_var",
+    "up_encoder_var", "up_split_eyes_var", "up_allow_sw_var", "up_schedule_var",
+)
 
 # The log pane and its backing list both grew for the lifetime of the session,
 # and a Tk text widget holds every line it has ever been given. Nothing here is
@@ -68,7 +313,11 @@ LOG_TRIM_TO = 1500
 # Slider-backed settings that must reach the FaceFusion CLI as integers.
 INT_SETTINGS = {"enhancer_blend", "frame_enhancer_blend", "quality", "threads", "upscale_scale",
                 "target_frame_amount", "reference_frame_number", "expression_restorer_factor",
-                "source_video_faces", "source_video_max_samples", "source_video_min_face_px"}
+                "source_video_faces", "source_video_max_samples", "source_video_min_face_px",
+                # A frame multiplier of 2.0 is not a thing; it is 2 or it is 3.
+                "interpolate_multi",
+                # Whole seconds; 0 turns chunking off.
+                "chunk_seconds"}
 
 # Encoders offered on the Upscale tab. NVENC first because it is 10x the speed
 # of software at these sizes; libx265/libx264 are there because NVENC refuses
@@ -79,6 +328,13 @@ UPSCALE_ENCODERS = ["hevc_nvenc", "av1_nvenc", "h264_nvenc", "libx265", "libx264
 # entry falls through to the "store the string" branch, and "2.0" in the config
 # file is not the same thing as 2.0 to the code that reads it back.
 FLOAT_SETTINGS = {"source_video_sample_fps"}
+
+# Settings shown on the Settings tab that belong to the GUARD RAILS, not to the
+# pipeline: they live in scripts/guardrails.json and are read by the guard, not
+# passed to FaceFusion. They are on the same tab because that is where a user
+# looks for them, but they must be saved to the other file - writing
+# parallel_eyes into pipeline_config.json would put it somewhere nothing reads.
+GUARD_SETTINGS = {"parallel_eyes"}
 
 # Slider ranges, and how many decimals the read-out beside them shows. Kept in
 # one place so a range and its label cannot drift apart - a 0-1 weight rendered
@@ -101,6 +357,13 @@ SLIDER_RANGES = {
     "threads": (1, 8, 0),
     "mask_blur": (0.1, 1.5, 2),
     "upscale_scale": (1, 4, 0),
+    # 1 is off. Every step above 1 adds a whole synthesised frame per source
+    # frame per eye, at roughly a second each on a 4096x4096 eye.
+    "interpolate_multi": (1, 4, 0),
+    # Fraction of the frame the RIFE model runs on. Below ~0.5 the synthesised
+    # frames get visibly soft; at 1.0 the model needs 15.8 GB of a 16.3 GB card
+    # and any other GPU user tips it into a ~50x slowdown.
+    "interpolate_scale": (0.5, 1.0, 2),
     # The identity average converges after a handful of genuinely different
     # views; past that every extra still is a near-duplicate re-weighting a
     # view already in the average.
@@ -112,15 +375,23 @@ SLIDER_RANGES = {
 # hard case: 4K per eye, ~6 faces in every frame, and both eyes processed. They
 # are an upper bound - single-subject footage runs several times faster, because
 # almost all of the cost is per-face, not per-frame.
+# The names used to carry a time - "Fast (~17 min/1min video)" and so on -
+# and those numbers were a single face-swap pass. A VR run swaps each eye
+# separately and then splits and merges 8192x4096 frames around them, so a
+# minute of VR source really costs the better part of an hour and a half at
+# 'Good', not thirty-one minutes. Rather than keep four numbers that are only
+# right for the 2D tab, the names now say what the preset DOES; how long a
+# particular run will take is worked out from the actual clip, resolution and
+# settings when Run is pressed, and printed before anything starts.
 QUALITY_PRESETS = {
-    'Fast (~17 min/1min video)': {
+    'Fast (swap only)': {
         'tooltip': 'Face swap only, no enhancement. Measured 3.5 frame/s.',
         'swapper_model': 'hyperswap_1a_256',
         'pixel_boost': '256x256',
         'enhancer_model': 'none',
         'frame_enhancer': 'none',
     },
-    'Good (~31 min/1min video)': {
+    'Good (swap + 512 enhancer)': {
         'tooltip': 'Face swap + 512px enhancement. Best speed/quality balance; '
                    'measured 1.95 frame/s.',
         'swapper_model': 'hyperswap_1a_256',
@@ -128,18 +399,19 @@ QUALITY_PRESETS = {
         'enhancer_model': 'gpen_bfr_512',
         'frame_enhancer': 'none',
     },
-    'Better (~38 min/1min video)': {
+    'Better (512 pixel boost)': {
         'tooltip': 'Adds 512px pixel boost for more detail per face. '
-                   'Measured 1.6 frame/s.',
+                   'Measured 1.6 frame/s, so about 2x the run time of Good.',
         'swapper_model': 'hyperswap_1a_256',
         'pixel_boost': '512x512',
         'enhancer_model': 'gpen_bfr_512',
         'frame_enhancer': 'none',
     },
-    'Best (~46 min/1min video)': {
-        'tooltip': '512px pixel boost + 1024px enhancement. gpen_bfr_2048 is '
-                   'deliberately not used here: it costs ~2x again for detail a '
-                   'face a few hundred pixels wide cannot carry.',
+    'Best (512 boost + 1024 enhancer)': {
+        'tooltip': '512px pixel boost + 1024px enhancement, and about 4x the '
+                   'run time of Good. gpen_bfr_2048 is deliberately not used: '
+                   'it costs ~2x again for detail a face a few hundred pixels '
+                   'wide cannot carry.',
         'swapper_model': 'hyperswap_1a_256',
         'pixel_boost': '512x512',
         'enhancer_model': 'gpen_bfr_1024',
@@ -156,7 +428,7 @@ QUALITY_PRESETS = {
 
 # Referenced by both tabs; keep it out of the widget code so renaming a preset
 # cannot leave a dangling key behind.
-DEFAULT_PRESET = 'Good (~31 min/1min video)'
+DEFAULT_PRESET = 'Good (swap + 512 enhancer)'
 CUSTOM_PRESET = 'Custom (Settings Tab)'
 
 # The settings a preset writes. Editing any of them in the Settings tab flips
@@ -177,8 +449,33 @@ class App(ctk.CTk):
         if os.path.exists(self.config_path):
             self.config = load_config(self.config_path)
 
+        # The handful of Settings-tab controls that belong to the guard rails
+        # (see GUARD_SETTINGS). Read from guardrails.json here so the widget
+        # opens on the value that is actually in force, and written back there
+        # by save_settings. They are deliberately NOT copied into a queued
+        # job's frozen config: the guard rails describe the machine, and the
+        # machine at 03:00 is the one that gets a say, not the machine as it
+        # was when the job was added.
+        self.guard_settings = {
+            key: value for key, value in guardrails.load_guard_config().items()
+            if key in GUARD_SETTINGS
+        }
+
         self.is_running = False
         self.current_thread = None
+        self._pause_baseline = 0.0
+        # The job list, whether it is being worked through, the job in flight,
+        # and whether the user asked for that job to be killed (so its failure
+        # is reported as "stopped", not as a pipeline error).
+        self.queue = []
+        self.queue_active = False
+        self._queue_after = None
+        self._active_job = None
+        self._active_interactive = True
+        self._stop_requested = False
+        # The Pause/Resume button on the running job's queue row, when one is
+        # shown. Kept so _sync_pause_button can follow a guard-driven freeze.
+        self._queue_row_pause_btn = None
         self.log_messages = []
         self.guard = None
 
@@ -193,12 +490,17 @@ class App(ctk.CTk):
         self._vram_thread = None
 
         self.setup_ui()
+        # After the widgets exist and before anything is logged: the fields it
+        # restores are what the resume report below is about.
+        self.start_session_memory()
+        self.load_queue()
 
         # Nothing must outlive the window. Closing used to leave FaceFusion and
         # ffmpeg running, still eating the machine with no UI left to stop them.
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.start_vram_sampler()
         self.log_machine_limits()
+        self.log_resume_state()
 
     def setup_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -227,12 +529,14 @@ class App(ctk.CTk):
         self.tabview.add("VR Mode")
         self.tabview.add("Normal Mode")
         self.tabview.add("Upscale")
+        self.tabview.add("Queue")
         self.tabview.add("Settings")
         self.tabview.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
         self.build_vr_tab()
         self.build_normal_tab()
         self.build_upscale_tab()
+        self.build_queue_tab()
         self.build_settings_tab()
 
         bottom_frame = ctk.CTkFrame(self, height=200)
@@ -258,6 +562,17 @@ class App(ctk.CTk):
                                            text_color="#888888")
         self.resource_label.grid(row=0, column=1, sticky="e", padx=(0, 10))
 
+        # Freezes the run where it stands instead of throwing away the stage
+        # in flight. Next to Stop because they are the two answers to "I need
+        # this machine back", and they cost very different things.
+        self.pause_btn = ctk.CTkButton(
+            header_row, text="PAUSE", width=90, height=26,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#a16207", hover_color="#ca8a04",
+            command=self.toggle_pause, state="disabled"
+        )
+        self.pause_btn.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
         # Always available, never disabled: if a run is misbehaving this is the
         # way out, and it kills the whole process tree rather than just asking.
         self.stop_btn = ctk.CTkButton(
@@ -266,7 +581,7 @@ class App(ctk.CTk):
             fg_color="#b91c1c", hover_color="#dc2626",
             command=self.stop_run, state="disabled"
         )
-        self.stop_btn.grid(row=0, column=2, sticky="e")
+        self.stop_btn.grid(row=0, column=3, sticky="e")
 
         self.log_text = ctk.CTkTextbox(bottom_frame, font=ctk.CTkFont(family="Consolas", size=11),
                                        wrap="word", activate_scrollbars=True)
@@ -348,10 +663,24 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab, text="Output Path", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
         )
-        self.vr_output_var = ctk.StringVar(
-            value=os.path.join(PROJECT_DIR, "output", "final",
-                              f"vr_deepfake_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+        # The _LR_180 suffix is not decoration. DeoVR, Skybox and Pigasus pick
+        # the layout off the filename before they read any metadata - which is
+        # the only reason the untagged SLR source plays correctly in the first
+        # place, since it carries no VR metadata either. The pipeline now also
+        # writes proper st3d/sv3d boxes, but the suffix costs nothing and
+        # covers the players that never look.
+        self._vr_output_stem = os.path.join(
+            PROJECT_DIR, "output", "final",
+            f"vr_deepfake_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         )
+        self._vr_output_auto = self._vr_output_stem + "_LR_180.mp4"
+        self.vr_output_var = ctk.StringVar(value=self._vr_output_auto)
+        # Remembered so that a restored name this app generated keeps following
+        # the layout radio, and so a finished run can hand the next job a fresh
+        # timestamp instead of quietly overwriting the render just produced.
+        # Only rewrites the name while it is still the one we generated, so a
+        # path the user typed or browsed to is never moved under them.
+        self.vr_layout_var.trace_add("write", self._sync_vr_output_suffix)
         self.vr_output_entry = ctk.CTkEntry(tab, textvariable=self.vr_output_var, width=350)
         self.vr_output_entry.grid(row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
         ctk.CTkButton(tab, text="Browse", width=70, command=self.browse_vr_output).grid(
@@ -407,12 +736,50 @@ class App(ctk.CTk):
             row=row, column=1, sticky="w", padx=pad_x, pady=pad_y
         )
 
+        row += 1
+        # On by default: a failed run leaves its finished stages in output/temp,
+        # and re-swapping an eye that already rendered is the better part of an
+        # hour of GPU time. Untick it to force everything from scratch.
+        self.vr_resume_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(tab, text="Resume from where the last attempt stopped",
+                        variable=self.vr_resume_var).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y
+        )
+        ctk.CTkLabel(tab, text="(reuses finished eyes; ignored if settings changed)",
+                     font=ctk.CTkFont(size=10), text_color="gray").grid(
+            row=row, column=2, columnspan=2, sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
+        ctk.CTkLabel(tab, text="Start At", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
+        )
+        self.vr_schedule_var = ctk.StringVar(value="")
+        ctk.CTkEntry(tab, textvariable=self.vr_schedule_var, width=140).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y
+        )
+        ctk.CTkLabel(tab, text=SCHEDULE_HINT, font=ctk.CTkFont(size=10),
+                     text_color="gray").grid(row=row, column=2, columnspan=2,
+                                             sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
+        ctk.CTkLabel(tab, text="A time here makes Run wait for it. Add to Queue lines "
+                              "jobs up to run one after another (see the Queue tab). "
+                              "The app has to stay open either way.",
+                     font=ctk.CTkFont(size=10), text_color="#888888").grid(
+            row=row, column=1, columnspan=3, sticky="w", padx=pad_x)
+
         row += 2
         self.vr_run_btn = ctk.CTkButton(
             tab, text="Run VR Pipeline", height=45, font=ctk.CTkFont(size=14, weight="bold"),
             command=self.run_vr, corner_radius=10
         )
         self.vr_run_btn.grid(row=row, column=1, padx=pad_x, pady=(10, 5))
+        ctk.CTkButton(
+            tab, text="Add to Queue", height=45, width=130,
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="#374151",
+            hover_color="#4b5563", corner_radius=10,
+            command=lambda: self.add_to_queue("vr")
+        ).grid(row=row, column=2, columnspan=2, sticky="w", padx=(5, 0), pady=(10, 5))
 
         row += 1
         ctk.CTkLabel(tab, text="VR Pipeline: Splits stereoscopic video, runs FaceFusion on each eye, merges back.",
@@ -479,10 +846,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab, text="Output Path", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
         )
-        self.nm_output_var = ctk.StringVar(
-            value=os.path.join(PROJECT_DIR, "output", "final",
-                              f"deepfake_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
-        )
+        self._nm_output_auto = os.path.join(
+            PROJECT_DIR, "output", "final",
+            f"deepfake_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+        self.nm_output_var = ctk.StringVar(value=self._nm_output_auto)
         self.nm_output_entry = ctk.CTkEntry(tab, textvariable=self.nm_output_var, width=350)
         self.nm_output_entry.grid(row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
         ctk.CTkButton(tab, text="Browse", width=70, command=self.browse_nm_output).grid(
@@ -533,6 +900,18 @@ class App(ctk.CTk):
                      text_color="gray").grid(row=row, column=3, padx=(5, 0), pady=pad_y)
 
         row += 1
+        self.nm_schedule_var = ctk.StringVar(value="")
+        ctk.CTkLabel(tab, text="Start At", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
+        )
+        ctk.CTkEntry(tab, textvariable=self.nm_schedule_var, width=140).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y
+        )
+        ctk.CTkLabel(tab, text=SCHEDULE_HINT, font=ctk.CTkFont(size=10),
+                     text_color="gray").grid(row=row, column=2, columnspan=2,
+                                             sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
         self.nm_keep_temp_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(tab, text="Keep temp files (debugging)", variable=self.nm_keep_temp_var).grid(
             row=row, column=1, sticky="w", padx=pad_x, pady=pad_y
@@ -544,6 +923,12 @@ class App(ctk.CTk):
             command=self.run_normal, corner_radius=10
         )
         self.nm_run_btn.grid(row=row, column=1, padx=pad_x, pady=(10, 5))
+        ctk.CTkButton(
+            tab, text="Add to Queue", height=45, width=130,
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="#374151",
+            hover_color="#4b5563", corner_radius=10,
+            command=lambda: self.add_to_queue("normal")
+        ).grid(row=row, column=2, columnspan=2, sticky="w", padx=(5, 0), pady=(10, 5))
 
         row += 1
         ctk.CTkLabel(tab, text="Normal Pipeline: Runs FaceFusion directly on the video (no split/merge).",
@@ -701,10 +1086,26 @@ class App(ctk.CTk):
                              padx=pad_x, pady=(12, 4))
 
         row += 1
+        ctk.CTkLabel(tab, text="Start At", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y)
+        self.up_schedule_var = ctk.StringVar(value="")
+        ctk.CTkEntry(tab, textvariable=self.up_schedule_var, width=140).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkLabel(tab, text=SCHEDULE_HINT, font=ctk.CTkFont(size=10),
+                     text_color="gray").grid(row=row, column=2, columnspan=2,
+                                             sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
         self.up_run_btn = ctk.CTkButton(
             tab, text="Run Upscale", height=45, font=ctk.CTkFont(size=14, weight="bold"),
             command=self.run_upscale_job, corner_radius=10)
         self.up_run_btn.grid(row=row, column=1, padx=pad_x, pady=(6, 5))
+        ctk.CTkButton(
+            tab, text="Add to Queue", height=45, width=130,
+            font=ctk.CTkFont(size=13, weight="bold"), fg_color="#374151",
+            hover_color="#4b5563", corner_radius=10,
+            command=lambda: self.add_to_queue("upscale")
+        ).grid(row=row, column=2, columnspan=2, sticky="w", padx=(5, 0), pady=(6, 5))
 
         self.refresh_upscale_preview()
 
@@ -738,26 +1139,30 @@ class App(ctk.CTk):
         or keeping a second copy of the logic, so the two front ends cannot
         drift apart.
         """
-        headset = self.up_headset_var.get()
+        return self._upscale_args_from(self._tab_fields("upscale"))
+
+    def _upscale_args_from(self, fields):
+        """The options object for an upscale job's frozen fields."""
+        headset = fields.get("headset") or "none"
         return SimpleNamespace(
-            input=self.up_input_var.get().strip(),
-            output=self.up_output_var.get().strip(),
-            target=self.up_target_var.get(),
+            input=(fields.get("input") or "").strip(),
+            output=(fields.get("output") or "").strip(),
+            target=fields.get("target"),
             scale=None,
-            layout=self.up_layout_var.get(),
-            method=self.up_method_var.get(),
+            layout=fields.get("layout"),
+            method=fields.get("method"),
             content=None,
             headset=None if headset == "none" else headset,
             # The tab owns these rather than reading the Settings tab: that one
             # configures the deepfake pipeline, and an upscale is a different
             # job with different trade-offs - a software encoder here is a
             # deliberate choice to exceed 8192px, not a fallback.
-            encoder=self.up_encoder_var.get(),
-            quality=int(round(self.up_quality_slider.get())),
-            allow_software=self.up_allow_sw_var.get(),
-            split_eyes=self.up_split_eyes_var.get(),
-            trim_start=self.parse_optional_float(self.up_trim_start_var.get()),
-            trim_end=self.parse_optional_float(self.up_trim_end_var.get()),
+            encoder=fields.get("encoder"),
+            quality=int(fields.get("quality") or 95),
+            allow_software=bool(fields.get("allow_sw")),
+            split_eyes=bool(fields.get("split_eyes")),
+            trim_start=self.parse_optional_float(fields.get("trim_start") or ""),
+            trim_end=self.parse_optional_float(fields.get("trim_end") or ""),
             keep_temp=False,
             yes=True,
         )
@@ -777,54 +1182,7 @@ class App(ctk.CTk):
         self.up_preview.insert("end", "\n".join(lines))
 
     def run_upscale_job(self):
-        args = self.upscale_args()
-        if not args.input or not args.output:
-            messagebox.showerror("Error", "Please choose an input video and an output path.")
-            return
-        if not os.path.exists(args.input):
-            messagebox.showerror("Error", "Input not found: " + args.input)
-            return
-
-        self.log("=" * 50)
-        self.log("UPSCALE STARTED")
-        self.set_blocked(True)
-        self.progress_bar.set(0)
-        self.guard = ResourceGuard(
-            os.path.join(PROJECT_DIR, "output", "temp"), guardrails.load_guard_config(),
-            log_cb=lambda m: self.after(0, self.log, m),
-        ).start()
-
-        self.current_thread = threading.Thread(
-            target=self._run_upscale_thread, args=(args,), daemon=True)
-        self.current_thread.start()
-
-    def _run_upscale_thread(self, args):
-        start_time = time.time()
-        try:
-            code = upscale_vr.run_upscale(
-                args,
-                log_fn=lambda m: self.after(0, self.log, m),
-                progress_cb=lambda p, t: self.after(0, self.update_progress, p, t),
-                guard=self.guard,
-            )
-            elapsed = time.time() - start_time
-            if code == 0:
-                self.after(0, self.update_progress, 100, "Upscale complete")
-                self.after(0, self.log, "Upscale complete! (%.0fs)" % elapsed)
-                self.after(0, self.update_status, "Done", "#4ade80")
-                self.after(0, lambda: messagebox.showinfo(
-                    "Success", "Upscale complete!\n\nOutput: %s\nTime: %.0fs"
-                               % (args.output, elapsed)))
-            else:
-                self.after(0, self.update_status, "Failed", "#f87171")
-                self.after(0, lambda: messagebox.showerror(
-                    "Upscale failed", "See the log for what stopped it."))
-        except Exception as e:
-            self.after(0, self.log, "Upscale failed: %s" % e)
-            self.after(0, self.update_status, "Failed", "#f87171")
-            self.after(0, lambda err=e: messagebox.showerror("Upscale failed", str(err)))
-        finally:
-            self.after(0, self.finish_run)
+        self._run_now_or_queue("upscale")
 
     def build_settings_tab(self):
         tab = self.tabview.tab("Settings")
@@ -1007,6 +1365,30 @@ class App(ctk.CTk):
                 ("Scale Factor", "upscale_scale", "slider", None),
                 ("Target Width (px)", "upscale_target_width", "entry", None),
             ]),
+            ("Frame Interpolation - RIFE (optional, very slow)", [
+                ("Frame Rate Multiplier", "interpolate_multi", "slider", None),
+                ("Model Resolution", "interpolate_scale", "slider", None),
+            ]),
+            # The selected range is processed in pieces of this many seconds,
+            # each one a finished, playable file in <output>_chunks/ before
+            # the next starts, and joined at the end. A run that dies keeps
+            # every finished piece and the next run continues from there.
+            # 0 processes the whole range in one go, the old behaviour.
+            ("Chunked Processing", [
+                ("Chunk Length (seconds, 0 = off)", "chunk_seconds", "entry", None),
+                # Both eyes swapped at once in two FaceFusion processes, when
+                # the machine can hold them. "auto" measures the free VRAM,
+                # commit and RAM before every run and says no when two lanes
+                # would not fit - which on this card is any 4K-per-eye run with
+                # a face enhancer, because one pass alone holds ~7 GB of 16.3.
+                # "on" skips the commit and RAM margins but never the VRAM one:
+                # overcommitting the card is not a slow run, it is Windows
+                # paging GPU memory into system RAM and a desktop that stops
+                # answering. The log says which way the verdict went and why,
+                # before anything starts.
+                ("Both Eyes At Once", "parallel_eyes", "combobox",
+                 ["auto", "on", "off"]),
+            ]),
         ]
 
         for section_name, fields in sections:
@@ -1021,7 +1403,8 @@ class App(ctk.CTk):
                     row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
                 )
 
-                val = self.config.get(key)
+                val = (self.guard_settings.get(key) if key in GUARD_SETTINGS
+                       else self.config.get(key))
 
                 if widget_type == "combobox":
                     w = ctk.CTkComboBox(tab, values=opts, width=200, state="readonly")
@@ -1160,12 +1543,45 @@ class App(ctk.CTk):
         with open(config_file, "w") as f:
             json.dump(self.config, f, indent=2)
 
+        self._save_guard_settings()
+
         self.log("Settings saved.")
         messagebox.showinfo("Settings", "Settings saved successfully.")
 
+    def _save_guard_settings(self):
+        """
+        Write the guard-backed Settings widgets into scripts/guardrails.json.
+
+        Re-read and merged rather than rewritten from anything held in memory:
+        that file is meant to be edited by hand, load_guard_config() re-derives
+        some of it from the machine on every load, and a save from this tab
+        must not quietly stamp either of those out.
+        """
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guardrails.json")
+        try:
+            with open(path) as handle:
+                stored = json.load(handle)
+        except (OSError, ValueError):
+            stored = guardrails.load_guard_config()
+        changed = {key: value for key, value in self.guard_settings.items()
+                   if stored.get(key) != value}
+        if not changed:
+            return
+        stored.update(self.guard_settings)
+        try:
+            with open(path, "w") as handle:
+                json.dump(stored, handle, indent=2)
+        except OSError as exc:
+            self.log(f"[Settings] Could not write guardrails.json: {exc}")
+            return
+        for key, value in changed.items():
+            self.log(f"[Settings] Guard rails: {key} is now {value} "
+                     f"(scripts/guardrails.json).")
+
     def apply_settings(self):
         """
-        Read every settings widget back into self.config.
+        Read every settings widget back into self.config, and the guard-backed
+        ones into self.guard_settings.
 
         save_settings() is this plus a write to disk. The two used to carry
         identical copies of this loop, which is exactly the shape where a new
@@ -1182,7 +1598,10 @@ class App(ctk.CTk):
                     val = None
                 if key == "expression_restorer":
                     val = (val == "on")
-                self.config[key] = val
+                if key in GUARD_SETTINGS:
+                    self.guard_settings[key] = val
+                else:
+                    self.config[key] = val
             elif w[0] == "slider":
                 # FaceFusion's CLI parses these as ints; a bare slider value
                 # would arrive as "95.0" and fail argparse.
@@ -1213,6 +1632,20 @@ class App(ctk.CTk):
                         self.config[key] = None
                 else:
                     self.config[key] = raw if raw else None
+        # The clip labels quote the chunk count, and the chunk length lives in
+        # the settings just read back, so a changed length shows up at once.
+        for label, start_var, end_var in (
+            (getattr(self, "vr_clip_label", None), getattr(self, "vr_trim_start_var", None),
+             getattr(self, "vr_trim_end_var", None)),
+            (getattr(self, "nm_clip_label", None), getattr(self, "nm_trim_start_var", None),
+             getattr(self, "nm_trim_end_var", None)),
+        ):
+            if label is not None and start_var is not None:
+                try:
+                    self._show_clip_summary(label, self.parse_optional_float(start_var.get()),
+                                            self.parse_optional_float(end_var.get()))
+                except Exception:
+                    pass
 
     def log(self, msg):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1235,6 +1668,11 @@ class App(ctk.CTk):
         self.status_label.configure(text=text, text_color="#4ade80")
 
     def set_blocked(self, blocked):
+        # A starting run is the moment worth remembering: a job the watchdog
+        # kills, or that takes the machine down with it, never reaches
+        # on_close, and its inputs are exactly the ones needed to resume.
+        if blocked:
+            self.save_session()
         self.is_running = blocked
         state = "disabled" if blocked else "normal"
         self.vr_run_btn.configure(state=state)
@@ -1244,6 +1682,12 @@ class App(ctk.CTk):
         self.nm_run_btn.configure(text="Running..." if blocked else "Run Normal Pipeline")
         self.up_run_btn.configure(text="Running..." if blocked else "Run Upscale")
         self.stop_btn.configure(state="normal" if blocked else "disabled")
+        self.pause_btn.configure(state="normal" if blocked else "disabled",
+                                 text="PAUSE")
+        self._sync_queue_buttons()
+        # The per-row Start buttons are disabled while a job runs and enabled
+        # when the machine is free; rebuild the list so they track the change.
+        self.refresh_queue_view()
 
     def log_machine_limits(self):
         """Show what the guard rails will allow, so limits are never a surprise."""
@@ -1254,11 +1698,60 @@ class App(ctk.CTk):
         free_disk = guardrails.free_disk_bytes(temp_dir)
 
         self.log("Guard rails active. Limits for this machine:")
-        self.log(f"  RAM {guardrails.fmt_gb(total_ram)} total / {guardrails.fmt_gb(avail_ram)} free "
-                 f"- pipeline capped at {guard_config['job_memory_cap_gb']} GB")
+        self.log(f"  RAM {guardrails.fmt_gb(total_ram)} total, "
+                 f"{guardrails.fmt_gb(total_ram - avail_ram)} in use by other programs, "
+                 f"{guardrails.fmt_gb(avail_ram)} free for a run")
+        self.log(f"  Commit limit {guardrails.fmt_gb(guardrails.commit_limit_bytes())} "
+                 f"(RAM + pagefile) - pipeline capped at "
+                 f"{guard_config['job_memory_cap_gb']} GB committed")
+        # The commit ceiling is the limit that actually bites on this machine,
+        # and unlike free RAM it is a setting rather than a fact. Say so before
+        # a job that may run for days, not after it has been killed.
+        info = guardrails.system_memory_breakdown()
+        if info and info.get("commit_limit"):
+            headroom = (info["commit_limit"] - info["commit_total"]
+                        - float(guard_config["job_memory_cap_gb"]) * guardrails.GB)
+            if info["commit_peak"] >= info["commit_limit"] * 0.98:
+                self.log(f"  WARNING: commit charge has already hit that ceiling since "
+                         f"boot. That is when Windows trims every working set and free "
+                         f"RAM collapses - the usual cause of an abort here. Raising "
+                         f"the pagefile raises the ceiling.")
+            elif headroom < 4 * guardrails.GB:
+                self.log(f"  WARNING: with the pipeline at its cap only "
+                         f"{guardrails.fmt_gb(max(0, headroom))} of commit is left for "
+                         f"the rest of the machine. Raising the pagefile is what buys "
+                         f"more.")
+        if guard_config.get("auto_pause_enabled", True):
+            self.log(f"  Below {guard_config.get('auto_pause_free_ram_gb', 5.0)} GB free "
+                     f"RAM a run FREEZES rather than dies - it hands its pages back and "
+                     f"thaws itself once "
+                     f"{guard_config.get('auto_resume_free_ram_gb', 7.5)} GB is free. "
+                     f"It freezes even if RAM falls straight past "
+                     f"{guard_config['min_free_ram_gb']} GB; it is only stopped if the "
+                     f"memory never comes back, or if commit charge or temp disk runs "
+                     f"out, which freezing cannot fix.")
+        else:
+            self.log(f"  A run stops automatically if free RAM drops below "
+                     f"{guard_config['min_free_ram_gb']} GB - so what matters is the "
+                     f"free figure above, not the total.")
         self.log(f"  CPU {os.cpu_count()} logical cores - pipeline capped at "
-                 f"{guard_config['cpu_percent_cap']}%, below-normal priority")
+                 f"{guard_config['cpu_percent_cap']}%, below-normal priority "
+                 f"({guard_config.get('cpu_percent_cap_unattended', 90)}% for a queued "
+                 f"job, when nobody is at the keyboard)")
         self.log(f"  VRAM {vram_total} MB")
+        mode = str(guard_config.get("parallel_eyes", "auto")).lower()
+        if mode == "off":
+            self.log("  Both eyes at once: off. Each eye is swapped in turn.")
+        else:
+            self.log(f"  Both eyes at once: {mode}. Before each VR run the free VRAM, "
+                     f"commit and RAM are measured and the run is told whether two "
+                     f"FaceFusion lanes fit; if not it swaps one eye at a time, as it "
+                     f"always has. Either lane can be frozen on its own if the machine "
+                     f"runs short - the other one keeps the GPU.")
+        if guard_config.get("overlap_stages", True):
+            self.log("  Chunked runs overlap their stages: the next chunk's split and "
+                     "the previous chunk's merge run underneath the face swap, which "
+                     "is otherwise using neither the encoder nor the CPU.")
         self.log(f"  Temp disk ({os.path.splitdrive(os.path.abspath(temp_dir))[0]}) "
                  f"{guardrails.fmt_gb(free_disk)} free - run stops automatically below "
                  f"{guard_config['min_free_disk_gb']} GB")
@@ -1267,6 +1760,37 @@ class App(ctk.CTk):
                      "output/temp at a larger drive.")
         self.log("Tune any of this in scripts/guardrails.json.")
         self.refresh_resource_label()
+        self.log_paging_setup()
+
+    def _sync_vr_output_suffix(self, *_args):
+        """Keep the generated output name in step with the layout radio."""
+        if self.vr_output_var.get() != self._vr_output_auto:
+            return
+        suffix = vr_metadata.suffix_for(self.vr_layout_var.get())
+        self._vr_output_auto = self._vr_output_stem + suffix + ".mp4"
+        self.vr_output_var.set(self._vr_output_auto)
+
+    def log_paging_setup(self):
+        """
+        Warn once, at startup, if Windows is paging to a mechanical disk.
+
+        On a machine whose RAM is smaller than what a VR run commits, this is
+        the difference between a run that finishes and one that locks the
+        desktop and gets killed by the watchdog. It is worth saying before the
+        user starts a two-hour job rather than after.
+
+        Off the UI thread: the query shells out to PowerShell and takes about a
+        second, and startup was deliberately made instant.
+        """
+        def probe():
+            try:
+                warning = guardrails.slow_pagefile_warning()
+            except Exception:
+                return
+            if warning:
+                self.after(0, self.log, f"[Guard] {warning}")
+
+        threading.Thread(target=probe, name="vrdeep-paging", daemon=True).start()
 
     def start_vram_sampler(self):
         """Poll nvidia-smi on a background thread so the UI never waits on it."""
@@ -1286,38 +1810,1279 @@ class App(ctk.CTk):
         try:
             # Both of these are cheap ctypes calls; the VRAM figure is whatever
             # the background sampler last saw, never a fresh nvidia-smi.
-            _, avail_ram, _ = guardrails.memory_status()
+            total_ram, avail_ram, _ = guardrails.memory_status()
             free_disk = guardrails.free_disk_bytes(os.path.join(PROJECT_DIR, "output", "temp"))
             self.resource_label.configure(
-                text=f"RAM free {guardrails.fmt_gb(avail_ram)}  |  "
+                text=f"RAM {guardrails.fmt_gb(total_ram - avail_ram)} used / "
+                     f"{guardrails.fmt_gb(total_ram)} - "
+                     f"{guardrails.fmt_gb(avail_ram)} free for this run  |  "
                      f"Temp disk free {guardrails.fmt_gb(free_disk)}  |  "
                      f"VRAM used {self._vram_used_mb} MB"
             )
         except Exception:
             pass
+        self._sync_pause_button()
         self.after(3000, self.refresh_resource_label)
 
     def stop_run(self):
-        """Kill the whole pipeline process tree immediately."""
-        if self.guard:
-            self.log("Stop requested - terminating all pipeline processes...")
-            self.guard.cancel("Stopped by user")
-            self.status_label.configure(text="Stopping...", text_color="#f59e0b")
+        """
+        Kill the whole pipeline process tree immediately.
+
+        With a queue running this also pauses the queue: someone pressing STOP
+        wants the machine back, and starting the next job a second later is
+        the opposite of that. The waiting jobs are kept; Start Queue resumes.
+        """
+        if self.is_running:
+            self._stop_requested = True
+            if self.queue_active:
+                self.queue_active = False
+                self.log("[Queue] Paused - the job in flight is being stopped and the "
+                         "next one will not start. Press Start Queue to carry on.")
+            if self.guard:
+                self.log("Stop requested - terminating all pipeline processes...")
+                self.guard.cancel("Stopped by user")
+                self.status_label.configure(text="Stopping...", text_color="#f59e0b")
+            else:
+                self.set_blocked(False)
+            return
+        if self.queue_active:
+            self.pause_queue("Paused while waiting for a start time. The jobs are "
+                             "still in the queue; Start Queue arms it again, Remove "
+                             "on the Queue tab drops one.")
+
+    # -- pause -------------------------------------------------------------
+
+    def toggle_pause(self):
+        """
+        Freeze the run where it stands, or thaw it.
+
+        Not the same offer as Stop. Stop ends the run and gives back the RAM
+        and the VRAM, keeping every stage that had finished - but the stage in
+        flight is lost, and at 8K that is up to an hour of swapping. Pause
+        keeps the run alive and exactly where it was, at the cost of holding
+        its memory. So: Pause to use the CPU for something else, Stop to get
+        the graphics card back.
+        """
+        if not self.guard or not self.is_running:
+            return
+        if self.guard.paused:
+            self.guard.resume()
+            self.pause_btn.configure(text="PAUSE", fg_color="#a16207",
+                                     hover_color="#ca8a04")
+            self._set_row_pause_label(False)
+            self.update_status("Running", "#4ade80")
+            self.log("Resumed. The paused time is not counted against the estimate.")
         else:
+            if not self.guard.pause():
+                return
+            self._pause_baseline = self.guard.paused_seconds()
+            self.pause_btn.configure(text="RESUME", fg_color="#15803d",
+                                     hover_color="#16a34a")
+            self._set_row_pause_label(True)
+            self.update_status("Paused", "#f59e0b")
+            self.log("Paused. Nothing is lost - Resume picks the run up mid-frame. "
+                     "The run keeps its RAM and VRAM while frozen; use STOP to get "
+                     "those back (finished stages are kept either way).")
+            self._pause_tick()
+
+    def _pause_tick(self):
+        """Keep the progress line honest about a run that is not moving."""
+        if not (self.guard and self.guard.paused and self.is_running):
+            return
+        held = self.guard.paused_seconds() - self._pause_baseline
+        if getattr(self.guard, "paused_by", None) == "guard":
+            text = (f"FROZEN for {guardrails.fmt_duration(held)} - the machine ran "
+                    f"low on memory; the run thaws itself when it comes back")
+        else:
+            text = (f"PAUSED for {guardrails.fmt_duration(held)} - "
+                    f"press RESUME to carry on where it stopped")
+        self.progress_label.configure(text=text)
+        self.after(1000, self._pause_tick)
+
+    def _sync_pause_button(self):
+        """
+        Follow the guard, which can freeze a run without being asked.
+
+        The watchdog freezes rather than aborts when memory gets tight, so the
+        button has to be able to say RESUME without anyone having pressed
+        PAUSE - otherwise pressing it would resume a run the user believed
+        they were pausing.
+        """
+        frozen = bool(self.guard and self.guard.paused)
+        wanted = "RESUME" if frozen else "PAUSE"
+        # The running job's queue row carries the same control; keep its label
+        # following the guard too, since a guard-driven freeze moves both.
+        row_btn = self._queue_row_pause_btn
+        if row_btn is not None:
+            try:
+                row_btn.configure(
+                    text="Resume" if frozen else "Pause",
+                    fg_color="#15803d" if frozen else "#a16207",
+                    hover_color="#16a34a" if frozen else "#ca8a04")
+            except Exception:
+                self._queue_row_pause_btn = None
+        if self.pause_btn.cget("text") == wanted:
+            return
+        self.pause_btn.configure(
+            text=wanted,
+            fg_color="#15803d" if frozen else "#a16207",
+            hover_color="#16a34a" if frozen else "#ca8a04")
+        if frozen:
+            by = getattr(self.guard, "paused_by", None)
+            self.update_status("Frozen - low memory" if by == "guard" else "Paused",
+                               "#f59e0b")
+            self._pause_baseline = self.guard.paused_seconds()
+            self._pause_tick()
+        elif self.is_running:
+            self.update_status("Running", "#4ade80")
+
+    def _set_row_pause_label(self, frozen):
+        """Point the running row's Pause/Resume button at the state just set."""
+        row_btn = self._queue_row_pause_btn
+        if row_btn is None:
+            return
+        try:
+            row_btn.configure(
+                text="Resume" if frozen else "Pause",
+                fg_color="#15803d" if frozen else "#a16207",
+                hover_color="#16a34a" if frozen else "#ca8a04")
+        except Exception:
+            self._queue_row_pause_btn = None
+
+    # -- job queue -----------------------------------------------------------
+    #
+    # A job is a dict: kind, fields (a frozen copy of the tab), config (the
+    # settings in force when it was added; None for an upscale), not_before,
+    # status, note, and timings. Every run goes through the queue - an
+    # immediate Run is a job that starts at once - so the Queue tab is also
+    # the history of what this window has done.
+
+    def build_queue_tab(self):
+        tab = self.tabview.tab("Queue")
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(3, weight=1)
+        pad_x = 10
+
+        ctk.CTkLabel(
+            tab, text="Jobs run one after another, top to bottom, one at a time. A job "
+                      "with a time against it waits for that time; the ones without "
+                      "run as soon as the machine is free. Add jobs from the other "
+                      "tabs with Add to Queue, or by pressing Run with a Start At time.",
+            font=ctk.CTkFont(size=11), text_color="gray", justify="left", wraplength=1100
+        ).grid(row=0, column=0, sticky="w", padx=pad_x, pady=(8, 6))
+
+        bar = ctk.CTkFrame(tab, fg_color="transparent")
+        bar.grid(row=1, column=0, sticky="ew", padx=pad_x, pady=(0, 4))
+        self.queue_start_btn = ctk.CTkButton(
+            bar, text="Start Queue", width=130, height=34,
+            font=ctk.CTkFont(size=12, weight="bold"), command=self.start_queue)
+        self.queue_start_btn.pack(side="left", padx=(0, 6))
+        self.queue_pause_btn = ctk.CTkButton(
+            bar, text="Pause Queue", width=130, height=34, fg_color="#a16207",
+            hover_color="#ca8a04", font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: self.pause_queue(
+                "Paused. The job in flight, if any, finishes; the next one waits "
+                "for Start Queue."))
+        self.queue_pause_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(bar, text="Re-queue Failed", width=130, height=34, fg_color="#374151",
+                      hover_color="#4b5563", command=self.requeue_failed).pack(
+            side="left", padx=(0, 6))
+        ctk.CTkButton(bar, text="Clear Finished", width=130, height=34, fg_color="#374151",
+                      hover_color="#4b5563", command=self.clear_finished).pack(
+            side="left", padx=(0, 6))
+        self.queue_summary = ctk.CTkLabel(bar, text="", font=ctk.CTkFont(size=11),
+                                          text_color="#888888")
+        self.queue_summary.pack(side="left", padx=(12, 0))
+
+        opts = ctk.CTkFrame(tab, fg_color="transparent")
+        opts.grid(row=2, column=0, sticky="ew", padx=pad_x, pady=(0, 6))
+        self.queue_stop_on_failure_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opts, text="Stop the queue when a job fails",
+                        variable=self.queue_stop_on_failure_var,
+                        command=self.save_queue).pack(side="left", padx=(0, 20))
+        self.queue_keep_order_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opts, text="Keep strict order: wait for a timed job rather "
+                                   "than running the ones after it first",
+                        variable=self.queue_keep_order_var,
+                        command=self.save_queue).pack(side="left")
+
+        self.queue_rows = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        self.queue_rows.grid(row=3, column=0, sticky="nsew", padx=pad_x, pady=(0, 6))
+        self.queue_rows.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            tab, text="Not before: a clock time (02:30), tomorrow 02:30, +90m, or a "
+                      "date and time - type it and press Enter. Empty means as soon "
+                      "as possible. Edit puts a job back on its tab to change it.",
+            font=ctk.CTkFont(size=10), text_color="#888888", justify="left",
+            wraplength=1100
+        ).grid(row=4, column=0, sticky="w", padx=pad_x, pady=(0, 6))
+
+        self.refresh_queue_view()
+
+    def refresh_queue_view(self):
+        """Rebuild the job list. The list is short; rebuilding beats diffing."""
+        rows = getattr(self, "queue_rows", None)
+        if rows is None:
+            return
+        # Rebuilt below; the old one is about to be destroyed with its row.
+        self._queue_row_pause_btn = None
+        for child in rows.winfo_children():
+            child.destroy()
+
+        if not self.queue:
+            ctk.CTkLabel(rows, text="The queue is empty. Fill in a tab and press "
+                                    "Add to Queue.",
+                         text_color="#888888").grid(row=0, column=0, sticky="w", pady=10)
+        for index, job in enumerate(self.queue):
+            self._build_queue_row(rows, index, job)
+
+        counts = {}
+        for job in self.queue:
+            counts[job["status"]] = counts.get(job["status"], 0) + 1
+        parts = [f"{n} {status}" for status, n in counts.items()]
+        state = "running" if self.queue_active else "paused"
+        self.queue_summary.configure(
+            text=(f"{len(self.queue)} job(s): " + ", ".join(parts) + f"  -  queue {state}")
+            if self.queue else "")
+        self._sync_queue_buttons()
+
+    def _build_queue_row(self, parent, index, job):
+        status = job["status"]
+        frame = ctk.CTkFrame(parent)
+        frame.grid(row=index, column=0, sticky="ew", pady=3)
+        frame.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkLabel(frame, text=str(index + 1), width=28,
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, rowspan=2, padx=(8, 4))
+
+        when = job_not_before(job)
+        if status == "waiting" and when is not None:
+            status_text = "At " + when.strftime("%a %H:%M")
+        else:
+            status_text = status.capitalize()
+        ctk.CTkLabel(frame, text=status_text, width=110, anchor="w",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=JOB_STATUS_COLORS.get(status, "#ffffff")).grid(
+            row=0, column=1, rowspan=2, padx=(0, 6), sticky="w")
+
+        ctk.CTkLabel(frame, text=job_title(job), anchor="w",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=2, sticky="w", padx=(0, 6), pady=(4, 0))
+        ctk.CTkLabel(frame, text=job_detail(job), anchor="w",
+                     font=ctk.CTkFont(size=10), text_color="#aaaaaa").grid(
+            row=1, column=2, sticky="w", padx=(0, 6), pady=(0, 4))
+
+        if status == "waiting":
+            ctk.CTkLabel(frame, text="Not before", font=ctk.CTkFont(size=10),
+                         text_color="#888888").grid(row=0, column=3, rowspan=2, padx=(0, 4))
+            entry = ctk.CTkEntry(frame, width=150, font=ctk.CTkFont(size=11))
+            entry.insert(0, when.strftime("%Y-%m-%d %H:%M") if when else "")
+            entry.grid(row=0, column=4, rowspan=2, padx=(0, 10))
+            entry.bind("<Return>", lambda _e, j=job, w=entry: self._set_job_time(j, w))
+
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=0, column=5, rowspan=2, padx=(0, 8))
+        small = dict(width=34, height=26, font=ctk.CTkFont(size=11))
+        if status == "running":
+            # The run's controls, on the row that is actually running, so the
+            # machine can be paused or stopped without leaving the Queue tab.
+            # The bottom-bar PAUSE/STOP do the same thing; _sync_pause_button
+            # keeps this button's label following the guard, which can freeze a
+            # run on its own when memory gets tight.
+            pause_text = "Resume" if (self.guard and self.guard.paused) else "Pause"
+            self._queue_row_pause_btn = ctk.CTkButton(
+                buttons, text=pause_text, width=64, height=26,
+                font=ctk.CTkFont(size=11), fg_color="#a16207", hover_color="#ca8a04",
+                command=self.toggle_pause)
+            self._queue_row_pause_btn.pack(side="left", padx=2)
+            ctk.CTkButton(buttons, text="Stop", width=56, height=26,
+                          font=ctk.CTkFont(size=11), fg_color="#b91c1c",
+                          hover_color="#dc2626", command=self.stop_run).pack(
+                side="left", padx=2)
+            return
+        if status == "waiting":
+            ctk.CTkButton(buttons, text="\u25b2", command=lambda j=job: self.move_job(j, -1),
+                          fg_color="#374151", hover_color="#4b5563", **small).pack(
+                side="left", padx=2)
+            ctk.CTkButton(buttons, text="\u25bc", command=lambda j=job: self.move_job(j, 1),
+                          fg_color="#374151", hover_color="#4b5563", **small).pack(
+                side="left", padx=2)
+            # Run this one now, ahead of its start time and of the jobs above
+            # it. Disabled while anything is running - the machine does one job
+            # at a time. The rest of the queue is left exactly as it was.
+            ctk.CTkButton(buttons, text="Start", width=52, height=26,
+                          font=ctk.CTkFont(size=11), fg_color="#166534",
+                          hover_color="#15803d",
+                          state="disabled" if self.is_running else "normal",
+                          command=lambda j=job: self.start_job_now(j)).pack(
+                side="left", padx=2)
+            ctk.CTkButton(buttons, text="Edit", width=52, height=26,
+                          font=ctk.CTkFont(size=11), fg_color="#374151",
+                          hover_color="#4b5563",
+                          command=lambda j=job: self.edit_job(j)).pack(side="left", padx=2)
+        else:
+            ctk.CTkButton(buttons, text="Re-queue", width=72, height=26,
+                          font=ctk.CTkFont(size=11), fg_color="#374151",
+                          hover_color="#4b5563",
+                          command=lambda j=job: self.requeue_job(j)).pack(side="left", padx=2)
+        ctk.CTkButton(buttons, text="Remove", width=64, height=26,
+                      font=ctk.CTkFont(size=11), fg_color="#7f1d1d",
+                      hover_color="#991b1b",
+                      command=lambda j=job: self.remove_job(j)).pack(side="left", padx=2)
+
+    def _sync_queue_buttons(self):
+        """The queue's own buttons, and STOP while the queue waits with nothing running."""
+        start_btn = getattr(self, "queue_start_btn", None)
+        if start_btn is None:
+            return
+        waiting = any(j["status"] == "waiting" for j in self.queue)
+        if self.queue_active:
+            start_btn.configure(state="disabled", text="Queue Running")
+            self.queue_pause_btn.configure(state="normal")
+        else:
+            start_btn.configure(state="normal" if waiting else "disabled",
+                                text="Start Queue")
+            self.queue_pause_btn.configure(state="disabled")
+        if self.queue_active and not self.is_running:
+            self.stop_btn.configure(state="normal")
+
+    # -- building and running jobs ----------------------------------------------
+
+    def _tab_fields(self, kind):
+        fields = {}
+        for name, attr in JOB_FIELD_VARS[kind].items():
+            value = getattr(self, attr).get()
+            fields[name] = value.strip() if isinstance(value, str) else value
+        if kind == "upscale":
+            fields["quality"] = int(round(self.up_quality_slider.get()))
+        return fields
+
+    def _build_job(self, kind):
+        """
+        Freeze the tab into a job, checking it the way Run always has.
+
+        Returns None after showing the problem. The checks happen here, at the
+        moment of adding, so a queue armed for the night is a queue of jobs
+        that could actually start; the files are checked again at start time
+        because a night is long enough for a drive to be unplugged.
+        """
+        fields = self._tab_fields(kind)
+        config = None
+        if kind == "upscale":
+            if not fields["input"] or not fields["output"]:
+                messagebox.showerror("Error", "Please choose an input video and an output path.")
+                return None
+            if not os.path.exists(fields["input"]):
+                messagebox.showerror("Error", "Input not found: " + fields["input"])
+                return None
+        else:
+            # The same two calls Run has always made before starting, so the
+            # snapshot is exactly what a run pressed now would use. The copy is
+            # what lets the Settings tab be changed while this job waits.
+            self._apply_preset(fields["preset"])
+            self.apply_settings()
+            config = copy.deepcopy(self.config)
+            if not fields["source"] or not fields["target"] or not fields["output"]:
+                messagebox.showerror("Error", "Please fill in source face, target video, and output path.")
+                return None
+            if self.check_source(fields["source"]) is None:
+                return None
+            if not os.path.exists(fields["target"]):
+                messagebox.showerror("Error", f"Target video not found: {fields['target']}")
+                return None
+        schedule_var = getattr(self, JOB_SCHEDULE_VARS[kind])
+        try:
+            when = parse_schedule_time(schedule_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Start At", str(exc))
+            return None
+        return {
+            "id": f"job_{int(time.time() * 1000)}",
+            "kind": kind,
+            "fields": fields,
+            "config": config,
+            "not_before": when.strftime(NOT_BEFORE_FMT) if when else None,
+            "status": "waiting",
+            "note": "",
+            "added": datetime.now().strftime(NOT_BEFORE_FMT),
+            "started": None,
+            "finished": None,
+            "elapsed": None,
+        }
+
+    def _output_taken(self, job):
+        """Another unfinished job already writing to this job's output path."""
+        output = os.path.normcase(os.path.abspath(job["fields"]["output"]))
+        for other in self.queue:
+            if other is job or other["status"] not in ("waiting", "running"):
+                continue
+            if os.path.normcase(os.path.abspath(other["fields"]["output"])) == output:
+                return other
+        return None
+
+    def _job_problem(self, job):
+        """A reason this job cannot start right now, or None."""
+        f = job["fields"]
+        if job["kind"] == "upscale":
+            if not os.path.exists(f["input"]):
+                return f"Input not found: {f['input']}"
+            return None
+        missing = [p for p in split_sources(f["source"]) if not os.path.exists(p)]
+        if missing:
+            return f"Source face not found: {missing[0]}"
+        if not os.path.exists(f["target"]):
+            return f"Target video not found: {f['target']}"
+        return None
+
+    def add_to_queue(self, kind):
+        job = self._build_job(kind)
+        if job is None:
+            return
+        if not self._enqueue(job):
+            return
+        when = job_not_before(job)
+        self.log(f"[Queue] Added job {len(self.queue)}: {job_title(job)}"
+                 + (f", not before {when.strftime('%a %d %b %H:%M')}" if when else "")
+                 + ". Press Start Queue on the Queue tab when the list is ready"
+                 + (" - or leave it, the queue is running." if self.queue_active else "."))
+
+    def _enqueue(self, job):
+        taken = self._output_taken(job)
+        if taken is not None:
+            messagebox.showerror(
+                "Output already queued",
+                f"Job {self.queue.index(taken) + 1} ({job_title(taken)}) already writes "
+                f"to\n{job['fields']['output']}\n\nChoose a different output path.")
+            return False
+        self.queue.append(job)
+        getattr(self, JOB_SCHEDULE_VARS[job["kind"]]).set("")
+        # A queued render owns its name; the tab gets a fresh one so the next
+        # Add to Queue cannot silently point at the same file.
+        if job["fields"]["output"] in (self._vr_output_auto, self._nm_output_auto):
+            self._retire_auto_output()
+        self.save_queue()
+        self.refresh_queue_view()
+        return True
+
+    def _run_now_or_queue(self, kind):
+        """Run: at once, or - with a Start At time - as a queued job for that time."""
+        job = self._build_job(kind)
+        if job is None:
+            return
+        if job["not_before"]:
+            if not self._enqueue(job):
+                return
+            when = job_not_before(job)
+            self.log(f"[Schedule] {job_title(job)} armed for "
+                     f"{when.strftime('%a %d %b %H:%M:%S')} as queue job "
+                     f"{len(self.queue)}. This window has to stay open; STOP pauses "
+                     f"the queue, Remove on the Queue tab cancels it.")
+            if not self.queue_active:
+                self.start_queue()
+            return
+        if self.is_running:
+            return
+        if self._output_taken(job) is not None:
+            taken = self._output_taken(job)
+            messagebox.showerror(
+                "Output already queued",
+                f"Queue job {self.queue.index(taken) + 1} already writes to\n"
+                f"{job['fields']['output']}\n\nChoose a different output path.")
+            return
+        self.queue.append(job)
+        getattr(self, JOB_SCHEDULE_VARS[kind]).set("")
+        if not self._launch_job(job, interactive=True):
+            self.queue.remove(job)
+        self.save_queue()
+        self.refresh_queue_view()
+
+    def _launch_job(self, job, interactive):
+        """
+        Start one job on this machine now. True once it is running.
+
+        `interactive` is whether someone is at the keyboard: an immediate Run
+        may ask before forcing past the guard rails and gets a dialog at the
+        end; a queued job never blocks on a dialog nobody will answer.
+        """
+        kind = job["kind"]
+        f = job["fields"]
+        problem = self._job_problem(job)
+        if problem:
+            self.log(f"[Job] Not started - {problem}")
+            self._mark_job(job, "failed", problem)
+            if interactive:
+                messagebox.showerror("Error", problem)
+            return False
+
+        position = self.queue.index(job) + 1 if job in self.queue else 0
+        self.log("=" * 50)
+        self.log(f"{JOB_HEADINGS[kind]} STARTED"
+                 + (f"  (queue job {position} of {len(self.queue)})"
+                    if not interactive else ""))
+
+        if kind == "upscale":
+            self.log(f"Input: {f['input']}")
+            self.log(f"Output: {f['output']}")
+            guard_config = guardrails.load_guard_config()
+            prepared = None
+        else:
+            is_vr = kind == "vr"
+            self.log(f"Quality preset: {f['preset']}")
+            self.log(self.check_source(f["source"]) or "")
+            self.log(f"Source: {f['source']}")
+            self.log(f"Target: {f['target']}")
+            if is_vr:
+                self.log(f"Layout: {f['layout'].upper()}")
+            self.log(f"Output: {f['output']}")
+            trim_start = self.parse_optional_float(f["trim_start"])
+            trim_end = self.parse_optional_float(f["trim_end"])
+            # The run log is the only record of what a two-hour job actually
+            # processed, so it has to say which portion of the target that was.
+            if trim_start is not None or trim_end is not None:
+                self.log(f"Clip: {clip_selector.format_timecode(trim_start) or 'start'} to "
+                         f"{clip_selector.format_timecode(trim_end) or 'end'}")
+            self._log_chunk_plan(f["target"], trim_start, trim_end, f["output"],
+                                 config=job["config"])
+            prepared = self.preflight_or_confirm(
+                f["target"], is_vr, trim_start, trim_end,
+                unattended=not interactive, config=job["config"])
+            if prepared is None:
+                error = self._last_preflight_error
+                # Unattended only. Someone sitting in front of the app has
+                # already been offered the override dialog and said no, and
+                # holding their job for five minutes after that is not what
+                # they asked for.
+                if not interactive and getattr(error, "transient", False):
+                    self._defer_job(job, error)
+                    return False
+                self._mark_job(job, "failed", "Not started: the guard rails refused it "
+                                              "(see the log)")
+                return False
+            guard_config = prepared[1]
+            # It got past the preflight, so whatever it was waiting for is
+            # back. Clear the deferral bookkeeping or the give-up clock would
+            # keep counting from the first deferral of a job that has since run.
+            job.pop("retry_after", None)
+            job.pop("deferred_since", None)
+
+        self._active_job = job
+        self._active_interactive = interactive
+        self._stop_requested = False
+        job["started"] = datetime.now().strftime(NOT_BEFORE_FMT)
+        self._mark_job(job, "running")
+        self.set_blocked(True)
+        self.progress_bar.set(0)
+        if prepared is not None:
+            self.show_estimate(prepared)
+        self.guard = ResourceGuard(
+            os.path.join(PROJECT_DIR, "output", "temp"), guard_config,
+            log_cb=lambda m: self.after(0, self.log, m),
+            # A queued job runs under the higher CPU cap: nobody is waiting on
+            # the desktop at 03:00, and the log says which cap was applied.
+        ).start(unattended=not interactive)
+        self.current_thread = threading.Thread(
+            target=self._job_thread, args=(job, prepared), daemon=True)
+        self.current_thread.start()
+        return True
+
+    def _defer_job(self, job, error):
+        """
+        Hold a queued job that was refused for memory, instead of failing it.
+
+        The job on Sep 10 01:16 was refused because another program still had
+        8 GB of commit charged. It failed, the queue moved on, and the machine
+        spent the night idle over a condition that clears by itself in minutes.
+        Nothing is retried harder here - the retry is a fresh preflight, so the
+        job starts the moment the memory is genuinely back and not a second
+        before - it is only not thrown away in the meantime.
+        """
+        guard_config = guardrails.load_guard_config()
+        minutes = float(guard_config.get("queue_retry_minutes", 5) or 5)
+        hours = float(guard_config.get("queue_retry_hours", 6) or 6)
+        now = datetime.now()
+        reason = preflight_reason_line(error)
+        first = not job.get("deferred_since")
+        if first:
+            job["deferred_since"] = now.strftime(NOT_BEFORE_FMT)
+        retry_at = now + timedelta(minutes=minutes)
+        job["retry_after"] = retry_at.strftime(NOT_BEFORE_FMT)
+        index = self.queue.index(job) + 1 if job in self.queue else 0
+        self.log(f"[Queue] Job {index} deferred - waiting for memory, retrying at "
+                 f"{retry_at.strftime('%H:%M')} (reason: {reason})")
+        if first:
+            self.log(f"[Queue] The queue is NOT stopping: this job stays where it is and "
+                     f"is tried again every {minutes:g} min for up to {hours:g} h. Only "
+                     f"then does it count as failed. Closing whatever the log named "
+                     f"above makes it start at the next attempt.")
+        self._mark_job(job, "deferred", f"Waiting for memory: {reason}")
+
+    def _deferral_expired(self, job, now):
+        """
+        True once a deferred job has waited longer than the queue will wait.
+
+        The memory that was going to come back has come back by then; what is
+        left is a machine that is simply too busy for this run, and a job that
+        silently retried forever would look exactly like a queue that had
+        stopped working. Marked failed with the reason from the last attempt.
+        """
+        since = _job_time(job, "deferred_since")
+        if since is None:
+            return False
+        hours = float(guardrails.load_guard_config().get("queue_retry_hours", 6) or 6)
+        if now - since < timedelta(hours=hours):
+            return False
+        index = self.queue.index(job) + 1 if job in self.queue else 0
+        note = job.get("note") or "Waiting for memory"
+        self.log(f"[Queue] Job {index} gave up after {hours:g} h of waiting for memory - "
+                 f"marking it failed. Last reason: {note}")
+        job.pop("retry_after", None)
+        self._mark_job(job, "failed", note)
+        return True
+
+    def _job_thread(self, job, prepared):
+        start_time = time.time()
+        kind = job["kind"]
+        f = job["fields"]
+        status, note = "done", ""
+        log_cb = lambda m: self.after(0, self.log, m)
+        progress_cb = lambda p, t: self.after(0, self.update_progress, p, t)
+        try:
+            if kind == "upscale":
+                code = upscale_vr.run_upscale(
+                    self._upscale_args_from(f), log_fn=log_cb,
+                    progress_cb=progress_cb, guard=self.guard)
+                if code != 0:
+                    status, note = "failed", "See the log for what stopped it."
+            else:
+                extra = {"layout": f["layout"]} if kind == "vr" else {}
+                run_chunked_pipeline(
+                    kind == "vr",
+                    source_face=f["source"],
+                    target_video=f["target"],
+                    output_path=f["output"],
+                    config=job["config"],
+                    fps=self.parse_optional_float(f["fps"]),
+                    trim_start=self.parse_optional_float(f["trim_start"]),
+                    trim_end=self.parse_optional_float(f["trim_end"]),
+                    keep_temp=bool(f.get("keep_temp")),
+                    resume=bool(f.get("resume", True)),
+                    progress_cb=progress_cb,
+                    log_cb=log_cb,
+                    guard=self.guard,
+                    prepared=prepared,
+                    refresh_source_faces=bool(f.get("refresh_faces")),
+                    **extra,
+                )
+        except PipelineError as e:
+            status, note = "failed", str(e)
+        except Exception as e:
+            status, note = "failed", f"Unexpected error: {e}"
+        self.after(0, self._job_finished, job, status, note, time.time() - start_time)
+
+    def _job_finished(self, job, status, note, elapsed):
+        """Back on the UI thread: record the outcome, tidy up, move the queue on."""
+        interactive = self._active_interactive
+        kind = job["kind"]
+        output = job["fields"]["output"]
+        if status == "failed" and self._stop_requested:
+            status, note = "stopped", "Stopped by user"
+        self._stop_requested = False
+        self._active_job = None
+
+        if status == "done":
+            self.log(f"{JOB_DONE_TEXT[kind]} ({elapsed:.0f}s)")
+            self.log(f"Output: {output}")
+            if kind == "upscale":
+                self.update_progress(100, "Upscale complete")
+            self.update_status("Done", "#4ade80")
+            # A finished render owns its name; the next job gets a fresh one -
+            # but only when the tab still points at this job's file.
+            if output in (self._vr_output_auto, self._nm_output_auto):
+                self._retire_auto_output()
+        elif status == "stopped":
+            self.log(f"{JOB_HEADINGS[kind].title()} stopped. ({elapsed:.0f}s)")
+            self.update_status("Stopped", "#f59e0b")
+        else:
+            self.log(f"Pipeline failed: {note}")
+            self.update_status("Failed", "#ef4444")
+
+        job["finished"] = datetime.now().strftime(NOT_BEFORE_FMT)
+        job["elapsed"] = round(elapsed)
+        self._mark_job(job, status, note)
+
+        # Tear the guard down off the UI thread. close() now waits for the
+        # run's own processes to actually exit so their committed memory is
+        # back before the next job is sized (see ResourceGuard.close) - without
+        # that, a queue's next job saw the finished job's ~13 GB of CUDA commit
+        # as still in use and the preflight refused it. That wait must not
+        # freeze the window, so it runs on a worker thread, and the queue does
+        # not move on - nor do the Run buttons re-enable - until it is done.
+        guard, self.guard = self.guard, None
+        self.vr_refresh_faces_var.set(False)
+        self.nm_refresh_faces_var.set(False)
+        self.progress_label.configure(text="Releasing memory...")
+        threading.Thread(
+            target=self._teardown_guard,
+            args=(guard, job, status, note, elapsed, interactive),
+            daemon=True).start()
+
+    def _teardown_guard(self, guard, job, status, note, elapsed, interactive):
+        """Worker thread: release the finished run's memory, then resume on the UI thread."""
+        if guard:
+            guard.close()
+        # close() waited for the run's own processes to exit; this waits the
+        # extra beat for the kernel to finish handing their committed memory
+        # back, so the next queued job is never sized against memory that is
+        # still mid-release. Bounded, and on this worker thread, so the window
+        # stays live throughout.
+        guardrails.wait_for_commit_release(log_cb=lambda m: self.after(0, self.log, m))
+        self.after(0, self._after_teardown, job, status, note, elapsed, interactive)
+
+    def _after_teardown(self, job, status, note, elapsed, interactive):
+        """On the UI thread once the memory is freed: report, and move the queue on."""
+        kind = job["kind"]
+        output = job["fields"]["output"]
+        # The pipeline builds a fair number of short-lived dicts and lists per
+        # run; collecting here keeps the idle footprint flat between runs.
+        gc.collect()
+        self.set_blocked(False)
+
+        if interactive:
+            if status == "done":
+                messagebox.showinfo(
+                    "Success",
+                    f"{JOB_DONE_TEXT[kind]}\n\nOutput: {output}\n"
+                    f"Time: {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+            elif status == "failed":
+                messagebox.showerror("Error", note)
+
+        if self.queue_active:
+            if status != "done" and self.queue_stop_on_failure_var.get():
+                self.pause_queue(f"Stopped because job {self.queue.index(job) + 1} "
+                                 f"{status}. Fix it, then press Start Queue.")
+                return
+            self._queue_after = self.after(500, self._queue_tick)
+
+    def _mark_job(self, job, status, note=None):
+        job["status"] = status
+        if note is not None:
+            job["note"] = note
+        self.save_queue()
+        self.refresh_queue_view()
+
+    # -- the queue itself --------------------------------------------------------
+
+    def start_queue(self):
+        if self.queue_active:
+            return
+        waiting = [j for j in self.queue if j["status"] == "waiting"]
+        if not waiting:
+            messagebox.showinfo("Queue", "Nothing is waiting. Add a job from one of the "
+                                         "other tabs first.")
+            return
+        self.queue_active = True
+        timed = [j for j in waiting if job_not_before(j)]
+        self.log(f"[Queue] Started: {len(waiting)} job(s) waiting"
+                 + (f", {len(timed)} with a start time" if timed else "")
+                 + ". This window has to stay open; STOP or Pause Queue holds it.")
+        for job in self.queue:
+            self._log_job_line(job)
+        self.refresh_queue_view()
+        self._queue_tick()
+
+    def pause_queue(self, why):
+        if self._queue_after is not None:
+            try:
+                self.after_cancel(self._queue_after)
+            except Exception:
+                pass
+        self._queue_after = None
+        was_active = self.queue_active
+        self.queue_active = False
+        if was_active:
+            self.log(f"[Queue] {why}")
+        if not self.is_running:
+            self.update_status("Ready", "#4ade80")
+            self.update_progress(0, "Progress: --")
             self.set_blocked(False)
+        self.refresh_queue_view()
+
+    def _queue_tick(self):
+        """Once a second while the queue is armed and nothing is running."""
+        self._queue_after = None
+        if not self.queue_active or self.is_running:
+            return
+        now = datetime.now()
+        due, earliest = None, None
+        for job in self.queue:
+            if job["status"] != "waiting":
+                continue
+            when = job_not_before(job)
+            if when is None or when <= now:
+                due = job
+                break
+            if earliest is None or when < earliest[0]:
+                earliest = (when, job)
+            if self.queue_keep_order_var.get():
+                # Strict order: nothing behind a timed job may overtake it.
+                break
+
+        if due is None and earliest is None:
+            self.queue_active = False
+            counts = {}
+            for job in self.queue:
+                counts[job["status"]] = counts.get(job["status"], 0) + 1
+            summary = ", ".join(f"{n} {s}" for s, n in counts.items())
+            self.log(f"[Queue] Finished - nothing left waiting ({summary}).")
+            self.update_status("Queue finished", "#4ade80")
+            self.update_progress(0, f"Queue finished: {summary}")
+            self.set_blocked(False)
+            return
+
+        if due is None:
+            when, job = earliest
+            left = (when - now).total_seconds()
+            self.update_status("Scheduled", "#60a5fa")
+            self.update_progress(
+                0, f"Next: {job_title(job)} at {when.strftime('%H:%M:%S')} - "
+                   f"{guardrails.fmt_duration(left)} to go")
+            self.stop_btn.configure(state="normal")
+            self._queue_after = self.after(1000, self._queue_tick)
+            return
+
+        self.log(f"[Queue] Starting job {self.queue.index(due) + 1} of {len(self.queue)}: "
+                 f"{job_title(due)}")
+        if not self._launch_job(due, interactive=False):
+            if self.queue_stop_on_failure_var.get():
+                self.pause_queue(f"Stopped because job {self.queue.index(due) + 1} could "
+                                 f"not start. Fix it, then press Start Queue.")
+                return
+            self._queue_after = self.after(200, self._queue_tick)
+
+    def _log_job_line(self, job):
+        when = job_not_before(job)
+        index = self.queue.index(job) + 1
+        if job["status"] == "waiting":
+            timing = (f"not before {when.strftime('%a %d %b %H:%M')}" if when
+                      else "as soon as the machine is free")
+        else:
+            timing = job["status"]
+        self.log(f"  {index:>2}. {job_title(job)}  [{timing}]")
+
+    # -- editing the list --------------------------------------------------------
+
+    def _set_job_time(self, job, entry):
+        try:
+            when = parse_schedule_time(entry.get())
+        except ValueError as exc:
+            messagebox.showerror("Not before", str(exc))
+            return
+        job["not_before"] = when.strftime(NOT_BEFORE_FMT) if when else None
+        self.log(f"[Queue] Job {self.queue.index(job) + 1} ({job_title(job)}) now starts "
+                 + (f"no earlier than {when.strftime('%a %d %b %H:%M')}." if when
+                    else "as soon as the machine is free."))
+        self.save_queue()
+        # The entry that fired this is destroyed by the rebuild; let the event
+        # finish first.
+        self.after(0, self.refresh_queue_view)
+
+    def move_job(self, job, delta):
+        index = self.queue.index(job)
+        target = index + delta
+        if target < 0 or target >= len(self.queue):
+            return
+        self.queue[index], self.queue[target] = self.queue[target], self.queue[index]
+        self.save_queue()
+        self.refresh_queue_view()
+
+    def start_job_now(self, job):
+        """
+        Run one waiting job immediately, ahead of its start time and the order.
+
+        The machine does one job at a time, so this is refused while anything
+        is running. The rest of the queue is untouched: if it was armed it
+        carries on from wherever it was once this job finishes; if it was not,
+        only this job runs. A start time on the job is honoured no longer -
+        pressing Start is the explicit "now" the time was standing in for.
+        """
+        if self.is_running:
+            messagebox.showinfo("Queue", "A job is already running - the machine does "
+                                         "one at a time. Wait for it, or press Stop first.")
+            return
+        if job not in self.queue or job["status"] != "waiting":
+            return
+        # A scheduled tick could otherwise fire between here and the launch and
+        # start a different job into the same one-at-a-time slot.
+        if self._queue_after is not None:
+            try:
+                self.after_cancel(self._queue_after)
+            except Exception:
+                pass
+            self._queue_after = None
+        self.log(f"[Queue] Starting job {self.queue.index(job) + 1} of {len(self.queue)} "
+                 f"now by request: {job_title(job)}")
+        self._launch_job(job, interactive=True)
+
+    def remove_job(self, job):
+        if job["status"] == "running":
+            return
+        self.queue.remove(job)
+        self.log(f"[Queue] Removed: {job_title(job)}")
+        self.save_queue()
+        self.refresh_queue_view()
+
+    def requeue_job(self, job):
+        """Put a finished, failed or stopped job back in line, at the end."""
+        if job["status"] == "running":
+            return
+        self.queue.remove(job)
+        job.update(status="waiting", note="", started=None, finished=None, elapsed=None)
+        self.queue.append(job)
+        self.log(f"[Queue] Re-queued as job {len(self.queue)}: {job_title(job)}")
+        self.save_queue()
+        self.refresh_queue_view()
+
+    def requeue_failed(self):
+        failed = [j for j in self.queue if j["status"] in ("failed", "stopped")]
+        if not failed:
+            messagebox.showinfo("Queue", "No failed or stopped jobs to re-queue.")
+            return
+        for job in failed:
+            self.requeue_job(job)
+
+    def clear_finished(self):
+        keep = [j for j in self.queue if j["status"] in ("waiting", "running")]
+        dropped = len(self.queue) - len(keep)
+        self.queue = keep
+        if dropped:
+            self.log(f"[Queue] Cleared {dropped} finished job(s) from the list.")
+        self.save_queue()
+        self.refresh_queue_view()
+
+    def edit_job(self, job):
+        """Send a waiting job back to its tab, so it can be changed and re-added."""
+        if job["status"] != "waiting":
+            return
+        kind = job["kind"]
+        self.queue.remove(job)
+        for name, attr in JOB_FIELD_VARS[kind].items():
+            if name in job["fields"]:
+                getattr(self, attr).set(job["fields"][name])
+        if kind == "upscale":
+            self.up_quality_slider.set(job["fields"].get("quality", 95))
+            self.on_up_quality_change(job["fields"].get("quality", 95))
+        elif job.get("config"):
+            # The job froze its settings; the tab has to show those, or the
+            # re-added job would quietly pick up whatever is there now.
+            self.config = copy.deepcopy(job["config"])
+            for key, w in self.settings_widgets.items():
+                val = self.config.get(key)
+                try:
+                    if w[0] == "combobox":
+                        if key == "expression_restorer":
+                            val = "on" if val else "off"
+                        w[1].set(val if val is not None else "none")
+                    elif w[0] == "slider" and val is not None:
+                        w[1].set(val)
+                        self.update_slider_label(key, float(val))
+                    elif w[0] == "entry":
+                        w[1].delete(0, "end")
+                        if val is not None:
+                            w[1].insert(0, str(val))
+                except Exception:
+                    pass
+            self._sync_preset_tooltips(job["fields"].get("preset", ""))
+        when = job_not_before(job)
+        getattr(self, JOB_SCHEDULE_VARS[kind]).set(
+            when.strftime("%Y-%m-%d %H:%M") if when else "")
+        for label, start_var, end_var in (
+            (getattr(self, "vr_clip_label", None), self.vr_trim_start_var, self.vr_trim_end_var),
+            (getattr(self, "nm_clip_label", None), self.nm_trim_start_var, self.nm_trim_end_var),
+        ):
+            self._show_clip_summary(label, self.parse_optional_float(start_var.get()),
+                                    self.parse_optional_float(end_var.get()))
+        if kind == "upscale":
+            self.refresh_upscale_preview()
+        self.log(f"[Queue] {job_title(job)} taken off the queue and put back on the "
+                 f"{JOB_TABS[kind]} tab. Press Add to Queue when it is right.")
+        self.save_queue()
+        self.refresh_queue_view()
+        self.tabview.set(JOB_TABS[kind])
+
+    # -- persistence -----------------------------------------------------------
+
+    def save_queue(self):
+        data = {
+            "saved": datetime.now().strftime(NOT_BEFORE_FMT),
+            "stop_on_failure": bool(self.queue_stop_on_failure_var.get()),
+            "keep_order": bool(self.queue_keep_order_var.get()),
+            "jobs": self.queue,
+        }
+        try:
+            os.makedirs(os.path.dirname(QUEUE_PATH), exist_ok=True)
+            with open(QUEUE_PATH, "w") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError as exc:
+            self.log(f"[Queue] Could not save the queue: {exc}")
+
+    def load_queue(self):
+        """
+        Bring back last session's list. Never auto-starts: a machine that
+        rebooted overnight should not begin rendering the moment the app opens.
+        """
+        try:
+            with open(QUEUE_PATH) as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return
+        jobs = []
+        for job in data.get("jobs") or []:
+            if not isinstance(job, dict) or job.get("kind") not in JOB_FIELD_VARS:
+                continue
+            if job.get("status") == "running":
+                job["status"] = "waiting"
+                job["note"] = ("Interrupted - the app closed while it ran; it restarts "
+                               "from its checkpoints")
+            jobs.append(job)
+        self.queue = jobs
+        self.queue_stop_on_failure_var.set(bool(data.get("stop_on_failure")))
+        self.queue_keep_order_var.set(bool(data.get("keep_order")))
+        self.refresh_queue_view()
+        waiting = [j for j in jobs if j["status"] == "waiting"]
+        if jobs:
+            self.log(f"[Queue] Restored {len(jobs)} job(s) from "
+                     f"{data.get('saved', 'an earlier session')}"
+                     + (f"; {len(waiting)} still waiting. Open the Queue tab and press "
+                        f"Start Queue to run them." if waiting else "."))
+            now = datetime.now()
+            overdue = [j for j in waiting if job_not_before(j) and job_not_before(j) < now]
+            if overdue:
+                self.log(f"[Queue] {len(overdue)} of them had a start time that has "
+                         f"already passed - they run as soon as the queue is started.")
+
+    def log_resume_state(self):
+        """
+        Say at launch what output/temp holds, and whether it is still useful.
+
+        Checked against the fields that were just restored, because half-built
+        eyes from a different target are not resumable work - they are 7 GB of
+        drive doing nothing, and nothing on the window said so.
+        """
+        keys = parts = None
+        target = self.vr_target_var.get().strip()
+        if target and os.path.exists(target):
+            try:
+                keys, parts = vr_stage_keys(
+                    split_sources(self.vr_source_var.get()), target, self.config,
+                    self.vr_layout_var.get(),
+                    self.parse_optional_float(self.vr_fps_var.get()),
+                    self.parse_optional_float(self.vr_trim_start_var.get()),
+                    self.parse_optional_float(self.vr_trim_end_var.get()),
+                    self.config.get("encoder", "hevc_nvenc"),
+                    quality_to_cq(self.config.get("quality", 80)), None,
+                )
+            except Exception:
+                keys = parts = None
+        for line in describe_run_state(keys=keys, parts=parts):
+            self.log(line)
+
+    def start_session_memory(self):
+        """Restore the last launch's fields, then keep them saved as they change."""
+        self._session_save_job = None
+        self._session_loading = True
+        try:
+            self.restore_session()
+        finally:
+            self._session_loading = False
+        for name in SESSION_VARS:
+            var = getattr(self, name, None)
+            if var is not None:
+                var.trace_add("write", self._session_changed)
+
+    def _session_changed(self, *_args):
+        """Debounced save - an entry box fires this once per keystroke."""
+        if self._session_loading:
+            return
+        if self._session_save_job is not None:
+            try:
+                self.after_cancel(self._session_save_job)
+            except Exception:
+                pass
+        self._session_save_job = self.after(1000, self.save_session)
+
+    def save_session(self):
+        self._session_save_job = None
+        data = {
+            "saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # Whether each output path is still the one this app generated. A
+            # path the user typed or browsed to is never moved under them.
+            "vr_output_is_auto": self.vr_output_var.get() == self._vr_output_auto,
+            "nm_output_is_auto": self.nm_output_var.get() == self._nm_output_auto,
+            "vars": {},
+        }
+        for name in SESSION_VARS:
+            var = getattr(self, name, None)
+            if var is not None:
+                data["vars"][name] = var.get()
+        try:
+            os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
+            with open(SESSION_PATH, "w") as handle:
+                json.dump(data, handle, indent=2)
+        except OSError as exc:
+            self.log(f"[Session] Could not save the current fields: {exc}")
+
+    def restore_session(self):
+        """Put back what the window held when it was last used."""
+        try:
+            with open(SESSION_PATH) as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return
+        saved = data.get("vars") or {}
+        for name in SESSION_VARS:
+            var = getattr(self, name, None)
+            if var is None or name not in saved:
+                continue
+            try:
+                var.set(saved[name])
+            except Exception:
+                # One unreadable field must not cost the user the other
+                # twenty-eight; it simply keeps its default.
+                pass
+
+        # The generated names carry a launch timestamp, so a restored one has
+        # to become the new "generated" name or the layout radio stops moving
+        # it and a finished run stops replacing it.
+        if data.get("vr_output_is_auto"):
+            self._adopt_vr_auto_output(self.vr_output_var.get())
+        if data.get("nm_output_is_auto"):
+            self._nm_output_auto = self.nm_output_var.get()
+
+        self._sync_preset_tooltips(self.vr_preset_var.get())
+        for label, start_var, end_var in (
+            (self.vr_clip_label, self.vr_trim_start_var, self.vr_trim_end_var),
+            (self.nm_clip_label, self.nm_trim_start_var, self.nm_trim_end_var),
+        ):
+            self._show_clip_summary(label,
+                                    self.parse_optional_float(start_var.get()),
+                                    self.parse_optional_float(end_var.get()))
+        try:
+            self.refresh_upscale_preview()
+        except Exception:
+            pass
+        self.report_session(data.get("saved", "an earlier session"))
+
+    def report_session(self, saved_at):
+        """
+        Say what came back, and say it loudly when an input has since moved.
+
+        A source or target that is gone is not a cosmetic problem: those paths
+        are part of the resume key, so a re-browse to the same file in a new
+        location restarts the whole job from the split.
+        """
+        self.log(f"[Session] Restored the clip, source and timings from {saved_at}.")
+        if self.vr_target_var.get():
+            self.log(f"  Target: {self.vr_target_var.get()}")
+        if self.vr_source_var.get():
+            self.log(f"  Source: {self.vr_source_var.get()}")
+        start = self.vr_trim_start_var.get().strip()
+        end = self.vr_trim_end_var.get().strip()
+        if start or end:
+            self.log(f"  Clip: {start or 'start'} to {end or 'end'}")
+        missing = [path for path in
+                   ([self.vr_target_var.get().strip()]
+                    + split_sources(self.vr_source_var.get()))
+                   if path and not os.path.exists(path)]
+        for path in missing:
+            self.log(f"[Session] WARNING - this file is no longer where it was: {path}")
+
+    def _adopt_vr_auto_output(self, path):
+        """Treat `path` as the name this app generated, layout suffix and all."""
+        self._vr_output_auto = path
+        stem = os.path.splitext(path)[0]
+        suffix = vr_metadata.suffix_for(self.vr_layout_var.get())
+        if stem.upper().endswith(suffix.upper()):
+            stem = stem[:-len(suffix)]
+        self._vr_output_stem = stem
+
+    def _retire_auto_output(self):
+        """
+        A finished render owns its name; the next job gets a fresh one.
+
+        Only for names this app generated - a path the user chose stays put,
+        and a run that failed keeps its name so the retry writes to the file
+        the resume is rebuilding.
+        """
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self.vr_output_var.get() == self._vr_output_auto:
+            suffix = vr_metadata.suffix_for(self.vr_layout_var.get())
+            self._vr_output_stem = self._fresh_auto_stem("vr_deepfake_", stamp, suffix)
+            self._vr_output_auto = self._vr_output_stem + suffix + ".mp4"
+            self.vr_output_var.set(self._vr_output_auto)
+        if self.nm_output_var.get() == self._nm_output_auto:
+            self._nm_output_auto = self._fresh_auto_stem("deepfake_", stamp, "") + ".mp4"
+            self.nm_output_var.set(self._nm_output_auto)
+        self.save_session()
+
+    def _fresh_auto_stem(self, prefix, stamp, suffix):
+        """
+        A generated name nothing else is using.
+
+        The stamp only has seconds in it, and two presses of Add to Queue can
+        land in the same second - which used to hand the second job the first
+        job's output path and get it refused as a duplicate.
+        """
+        taken = {os.path.normcase(os.path.abspath(j["fields"]["output"]))
+                 for j in self.queue if j.get("fields", {}).get("output")}
+        taken.add(os.path.normcase(os.path.abspath(self._vr_output_auto)))
+        taken.add(os.path.normcase(os.path.abspath(self._nm_output_auto)))
+        base = os.path.join(PROJECT_DIR, "output", "final", prefix + stamp)
+        stem, n = base, 1
+        while True:
+            path = stem + suffix + ".mp4"
+            if os.path.normcase(os.path.abspath(path)) not in taken and not os.path.exists(path):
+                return stem
+            n += 1
+            stem = f"{base}_{n}"
 
     def on_close(self):
+        if self.queue_active and not self.is_running:
+            waiting = [j for j in self.queue if j["status"] == "waiting"]
+            if not messagebox.askyesno(
+                "Quit",
+                f"The queue is waiting to start {len(waiting)} job(s).\n\n"
+                "Closing this window stops the wait - a queue needs the app open. "
+                "The jobs stay in the list for next time.\n\nQuit anyway?"
+            ):
+                return
+            self.pause_queue("Paused - the app was closed.")
         if self.is_running:
+            paused = " It is paused; quitting still kills it." if (
+                self.guard and self.guard.paused) else ""
+            queued = ("\nThe queue stops too; its waiting jobs are kept for next time."
+                      if self.queue_active else "")
             if not messagebox.askyesno(
                 "Quit",
                 "A conversion is still running.\n\n"
-                "Quitting will stop it and kill every FaceFusion/ffmpeg process.\n\nQuit anyway?"
+                "Quitting will stop it and kill every FaceFusion/ffmpeg process."
+                + paused + queued + "\n\nQuit anyway?"
             ):
                 return
+            self.queue_active = False
+            if self._active_job is not None:
+                self._active_job["status"] = "stopped"
+                self._active_job["note"] = "The app was closed while it ran"
+        self.save_queue()
+        self.save_session()
         self._vram_stop.set()
         if self.guard:
             self.guard.cancel("Application closed")
-            self.guard.close()
+            # No wait: the window is closing and the process is about to exit,
+            # so the OS reclaims everything wholesale - blocking the quit on a
+            # clean teardown would only make closing feel broken.
+            self.guard.close(wait_timeout=0)
         self.destroy()
 
     # A clip is offered alongside photos because FaceFusion averages the
@@ -1457,9 +3222,77 @@ class App(ctk.CTk):
         if clip_label is None:
             return
         if start is None and end is None:
-            clip_label.configure(text="")
+            text = ""
+        elif start is None:
+            text = f"up to {end:.1f}s"
+        elif end is None:
+            text = f"from {start:.1f}s"
         else:
-            clip_label.configure(text=f"{end - start:.1f}s selected")
+            text = f"{end - start:.1f}s selected"
+        # How the range will be cut up, so the answer to "is this going to be
+        # chunked?" is on screen before Run is pressed rather than in the log
+        # after it.
+        plan = self._chunk_plan_for(self._clip_target_for(clip_label), start, end)
+        if plan is not None:
+            if len(plan) > 1:
+                text = (f"{text} - {len(plan)} chunks of "
+                        f"~{int(round(self.config.get('chunk_seconds') or 0))}s").lstrip(" -")
+            elif self.config.get("chunk_seconds"):
+                text = f"{text} - 1 chunk".lstrip(" -")
+        clip_label.configure(text=text)
+
+    def _clip_target_for(self, clip_label):
+        if clip_label is getattr(self, "vr_clip_label", None):
+            return self.vr_target_var.get().strip()
+        if clip_label is getattr(self, "nm_clip_label", None):
+            return self.nm_target_var.get().strip()
+        return ""
+
+    def _chunk_plan_for(self, target, start, end, config=None):
+        """The (start, end) chunks a run would use now, or None if unknowable."""
+        chunk_seconds = (config or self.config).get("chunk_seconds") or 0
+        if not target or not os.path.exists(target) or is_image_path(target):
+            return None
+        cache = getattr(self, "_duration_cache", None)
+        if cache is None:
+            cache = self._duration_cache = {}
+        try:
+            stamp = (target, os.path.getsize(target), int(os.path.getmtime(target)))
+            if stamp not in cache:
+                cache.clear()
+                cache[stamp] = probe_video(target).get("duration") or 0.0
+            duration = cache[stamp]
+        except Exception:
+            return None
+        if not duration:
+            return None
+        return chunk_plan(duration, start, end, chunk_seconds)
+
+    def _log_chunk_plan(self, target, start, end, output, config=None):
+        """Say, before anything starts, exactly how the range will be cut up."""
+        plan = self._chunk_plan_for(target, start, end, config=config)
+        if plan is None:
+            return
+        chunk_seconds = (config or self.config).get("chunk_seconds") or 0
+        if len(plan) < 2:
+            if chunk_seconds:
+                self.log(f"[Chunks] The selected {plan[0][1] - plan[0][0]:.0f}s fits in one "
+                         f"chunk (chunk length is {chunk_seconds:.0f}s), so it runs as a "
+                         f"single job.")
+            else:
+                self.log("[Chunks] Chunking is off (chunk length 0); the whole range runs "
+                         "as a single job.")
+            return
+        self.log(f"[Chunks] The range will be processed in {len(plan)} chunks of "
+                 f"~{chunk_seconds:.0f}s, one after another:")
+        for i, (a, b) in enumerate(plan):
+            self.log(f"  {i + 1:>2}. {clip_selector.format_timecode(a)} to "
+                     f"{clip_selector.format_timecode(b)}  ({b - a:.0f}s)")
+        self.log(f"[Chunks] Each chunk is saved as a playable file in "
+                 f"{chunk_dir_for(output)} the moment it finishes. When all {len(plan)} "
+                 f"are done they are joined into {os.path.basename(output)} and the "
+                 f"chunk files are deleted. If the run stops early, the finished chunks "
+                 f"stay there and the next run continues from the first unfinished one.")
 
     def _select_clip(self, target_var, start_var, end_var, clip_label, label):
         """
@@ -1502,21 +3335,45 @@ class App(ctk.CTk):
             self.log(f"[{label}] Target portion: {clip_selector.format_timecode(start)} "
                      f"to {clip_selector.format_timecode(end)} ({end - start:.1f}s).")
 
-    def preflight_or_confirm(self, target, is_vr, trim_start, trim_end):
+    def preflight_or_confirm(self, target, is_vr, trim_start, trim_end,
+                             unattended=False, config=None):
         """
         Run the guard-rail preflight on the UI thread so problems can be shown
         in a dialog before anything heavy is spawned.
 
         Returns the `prepared` tuple to hand to the pipeline, or None to abort.
+        None on its own does not say why, and _launch_job has to know whether
+        the refusal was transient before it decides between failing a queued
+        job and holding it, so the exception is left in
+        self._last_preflight_error for the caller to read. Cleared on entry, so
+        a stale one can never be mistaken for this call's.
         """
+        config = config or self.config
+        self._last_preflight_error = None
         try:
             return prepare_run(
-                target, self.config, is_vr=is_vr,
+                target, config, is_vr=is_vr,
                 trim_start=trim_start, trim_end=trim_end,
                 log_cb=self.log, force=False,
             )
         except PipelineError as e:
+            self._last_preflight_error = e
             self.log(str(e))
+            if unattended:
+                # Nobody is at the keyboard - that is the whole point of a
+                # scheduled start. A dialog here would simply wait until
+                # morning with the run never begun and no reason on screen.
+                #
+                # A transient refusal is not reported as a dead end here: the
+                # caller is about to hold the job and try again, and saying
+                # "NOT started" of a job that starts twenty minutes later reads
+                # as a failure in the log for the rest of the night.
+                if not getattr(e, "transient", False):
+                    self.log("[Queue] The job was NOT started: the guard rails refused "
+                             "it, and an unattended run is never forced past them. The "
+                             "reason is directly above.")
+                    self.update_status("Not started", "#ef4444")
+                return None
             proceed = messagebox.askyesno(
                 "Guard rails: unsafe run",
                 f"{e}\n\n"
@@ -1529,224 +3386,38 @@ class App(ctk.CTk):
                 self.log("Run cancelled by guard rails.")
                 return None
             return prepare_run(
-                target, self.config, is_vr=is_vr,
+                target, config, is_vr=is_vr,
                 trim_start=trim_start, trim_end=trim_end,
                 log_cb=self.log, force=True,
             )
 
-    def run_vr(self):
-        self._apply_preset(self.vr_preset_var.get())
-        self.apply_settings()
-        self.log(f"Quality preset: {self.vr_preset_var.get()}")
+    def show_estimate(self, prepared):
+        """
+        Put the up-front time estimate where it cannot be missed.
 
-        source = self.vr_source_var.get().strip()
-        target = self.vr_target_var.get().strip()
-        output = self.vr_output_var.get().strip()
-
-        if not source or not target or not output:
-            messagebox.showerror("Error", "Please fill in source face, target video, and output path.")
-            return
-
-        source_summary = self.check_source(source)
-        if source_summary is None:
-            return
-        if not os.path.exists(target):
-            messagebox.showerror("Error", f"Target video not found: {target}")
-            return
-
-        self.log("=" * 50)
-        self.log("VR PIPELINE STARTED")
-        self.log(source_summary)
-        self.log(f"Source: {source}")
-        self.log(f"Target: {target}")
-        self.log(f"Layout: {self.vr_layout_var.get().upper()}")
-        self.log(f"Output: {output}")
-
-        trim_start = self.parse_optional_float(self.vr_trim_start_var.get())
-        trim_end = self.parse_optional_float(self.vr_trim_end_var.get())
-
-        # The run log is the only record of what a two-hour job actually
-        # processed, so it has to say which portion of the target that was.
-        if trim_start is not None or trim_end is not None:
-            self.log(f"Clip: {clip_selector.format_timecode(trim_start) or 'start'} to "
-                     f"{clip_selector.format_timecode(trim_end) or 'end'}")
-
-        prepared = self.preflight_or_confirm(target, True, trim_start, trim_end)
-        if prepared is None:
-            return
-
-        self.set_blocked(True)
-        self.progress_bar.set(0)
-        self.guard = ResourceGuard(
-            os.path.join(PROJECT_DIR, "output", "temp"), prepared[1],
-            log_cb=lambda m: self.after(0, self.log, m),
-        ).start()
-
-        self.current_thread = threading.Thread(
-            target=self._run_vr_thread,
-            args=(source, target, output, prepared, trim_start, trim_end),
-            daemon=True
-        )
-        self.current_thread.start()
-
-    def _run_vr_thread(self, source, target, output, prepared, trim_start, trim_end):
-        start_time = time.time()
+        prepare_run has already written the stage-by-stage breakdown into the
+        log, but the log is a scrolling wall during a run and this is the one
+        number someone wants before deciding to start a job that may still be
+        going tomorrow. The progress label carries it until the first stage
+        replaces it with a live figure.
+        """
         try:
-            run_vr_pipeline(
-                source_face=source,
-                target_video=target,
-                output_path=output,
-                config=self.config,
-                layout=self.vr_layout_var.get(),
-                fps=self.parse_optional_float(self.vr_fps_var.get()),
-                trim_start=trim_start,
-                trim_end=trim_end,
-                keep_temp=self.vr_keep_temp_var.get(),
-                progress_cb=lambda p, t: self.after(0, self.update_progress, p, t),
-                log_cb=lambda m: self.after(0, self.log, m),
-                guard=self.guard,
-                prepared=prepared,
-                refresh_source_faces=self.vr_refresh_faces_var.get(),
-            )
+            plan = (prepared[2] or {}).get("runtime") or {}
+            total = plan.get("total_seconds") or 0
+        except Exception:
+            return
+        if total:
+            chunks = (prepared[2] or {}).get("chunks") or []
+            self.update_progress(
+                0, f"Estimated {guardrails.fmt_duration(total)}"
+                   + (f" in {len(chunks)} chunks" if len(chunks) > 1 else "")
+                   + f" - finishing around {guardrails.fmt_clock(total)}")
 
-            elapsed = time.time() - start_time
-            self.after(0, self.log, f"VR Pipeline complete! ({elapsed:.0f}s)")
-            self.after(0, self.log, f"Output: {output}")
-            self.after(0, self.update_status, "Done", "#4ade80")
-
-            self.after(0, lambda: messagebox.showinfo(
-                "Success",
-                f"VR deepfake complete!\n\nOutput: {output}\nTime: {elapsed:.0f}s ({elapsed/60:.1f} min)"
-            ))
-
-        except PipelineError as e:
-            self.after(0, self.log, f"Pipeline failed: {e}")
-            self.after(0, self.update_status, "Failed", "#ef4444")
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
-
-        except Exception as e:
-            self.after(0, self.log, f"Unexpected error: {e}")
-            self.after(0, self.update_status, "Error", "#ef4444")
-            self.after(0, lambda: messagebox.showerror("Error", f"Unexpected error: {e}"))
-
-        finally:
-            self.after(0, self.finish_run)
-
-    def finish_run(self):
-        """Tear the guard down on the UI thread once a run ends, however it ended."""
-        if self.guard:
-            # close() closes the Job Object, and KILL_ON_JOB_CLOSE reaps every
-            # child with it - which is what actually returns the run's memory,
-            # host and device alike, since every model lives in a child process
-            # and never in this one.
-            self.guard.close()
-            self.guard = None
-        # Re-extract is a one-shot: leaving it ticked would silently re-run the
-        # source analysis on every subsequent run against the same clip, which
-        # is exactly the cost the cache exists to avoid.
-        self.vr_refresh_faces_var.set(False)
-        self.nm_refresh_faces_var.set(False)
-        # The pipeline builds a fair number of short-lived dicts and lists per
-        # run; collecting here keeps the idle footprint flat between runs
-        # instead of drifting up until a generation happens to trigger.
-        gc.collect()
-        self.set_blocked(False)
+    def run_vr(self):
+        self._run_now_or_queue("vr")
 
     def run_normal(self):
-        self._apply_preset(self.nm_preset_var.get())
-        self.apply_settings()
-        self.log(f"Quality preset: {self.nm_preset_var.get()}")
-
-        source = self.nm_source_var.get().strip()
-        target = self.nm_target_var.get().strip()
-        output = self.nm_output_var.get().strip()
-
-        if not source or not target or not output:
-            messagebox.showerror("Error", "Please fill in source face, target video, and output path.")
-            return
-
-        source_summary = self.check_source(source)
-        if source_summary is None:
-            return
-        if not os.path.exists(target):
-            messagebox.showerror("Error", f"Target video not found: {target}")
-            return
-
-        self.log("=" * 50)
-        self.log("NORMAL PIPELINE STARTED")
-        self.log(source_summary)
-        self.log(f"Source: {source}")
-        self.log(f"Target: {target}")
-        self.log(f"Output: {output}")
-
-        trim_start = self.parse_optional_float(self.nm_trim_start_var.get())
-        trim_end = self.parse_optional_float(self.nm_trim_end_var.get())
-
-        # The run log is the only record of what a two-hour job actually
-        # processed, so it has to say which portion of the target that was.
-        if trim_start is not None or trim_end is not None:
-            self.log(f"Clip: {clip_selector.format_timecode(trim_start) or 'start'} to "
-                     f"{clip_selector.format_timecode(trim_end) or 'end'}")
-
-        prepared = self.preflight_or_confirm(target, False, trim_start, trim_end)
-        if prepared is None:
-            return
-
-        self.set_blocked(True)
-        self.progress_bar.set(0)
-        self.guard = ResourceGuard(
-            os.path.join(PROJECT_DIR, "output", "temp"), prepared[1],
-            log_cb=lambda m: self.after(0, self.log, m),
-        ).start()
-
-        self.current_thread = threading.Thread(
-            target=self._run_normal_thread,
-            args=(source, target, output, prepared, trim_start, trim_end),
-            daemon=True
-        )
-        self.current_thread.start()
-
-    def _run_normal_thread(self, source, target, output, prepared, trim_start, trim_end):
-        start_time = time.time()
-        try:
-            run_normal_pipeline(
-                source_face=source,
-                target_video=target,
-                output_path=output,
-                config=self.config,
-                fps=self.parse_optional_float(self.nm_fps_var.get()),
-                trim_start=trim_start,
-                trim_end=trim_end,
-                keep_temp=self.nm_keep_temp_var.get(),
-                progress_cb=lambda p, t: self.after(0, self.update_progress, p, t),
-                log_cb=lambda m: self.after(0, self.log, m),
-                guard=self.guard,
-                prepared=prepared,
-                refresh_source_faces=self.nm_refresh_faces_var.get(),
-            )
-
-            elapsed = time.time() - start_time
-            self.after(0, self.log, f"Normal Pipeline complete! ({elapsed:.0f}s)")
-            self.after(0, self.log, f"Output: {output}")
-            self.after(0, self.update_status, "Done", "#4ade80")
-
-            self.after(0, lambda: messagebox.showinfo(
-                "Success",
-                f"Deepfake complete!\n\nOutput: {output}\nTime: {elapsed:.0f}s ({elapsed/60:.1f} min)"
-            ))
-
-        except PipelineError as e:
-            self.after(0, self.log, f"Pipeline failed: {e}")
-            self.after(0, self.update_status, "Failed", "#ef4444")
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
-
-        except Exception as e:
-            self.after(0, self.log, f"Unexpected error: {e}")
-            self.after(0, self.update_status, "Error", "#ef4444")
-            self.after(0, lambda: messagebox.showerror("Error", f"Unexpected error: {e}"))
-
-        finally:
-            self.after(0, self.finish_run)
+        self._run_now_or_queue("normal")
 
     def update_status(self, text, color):
         self.status_label.configure(text=text, text_color=color)
@@ -1759,7 +3430,7 @@ def main():
     finally:
         # Last line of defence: never leave children running behind the UI.
         if getattr(app, "guard", None):
-            app.guard.close()
+            app.guard.close(wait_timeout=0)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@
   "quality": 95,
   "output_video_preset": "slow",
   "provider": "cuda",
-  "threads": 3,
+  "threads": 6,
   "mask_types": "box occlusion region",
   "occluder_model": "xseg_1",
   "parser_model": "bisenet_resnet_34",
@@ -44,7 +44,10 @@
   "upscale_scale": 2,
   "upscale_target_width": null,
   "temporal_smoothing": false,
+  "interpolate_multi": 1,
+  "interpolate_scale": 0.75,
   "video_memory_strategy": "moderate",
   "temp_frame_format": "jpeg",
-  "workflow_strategy": "memory"
+  "workflow_strategy": "memory",
+  "chunk_seconds": 60
 }
