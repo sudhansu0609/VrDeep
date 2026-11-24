@@ -48,6 +48,7 @@ import guardrails
 import vr_metadata
 import upscale_vr
 import clip_selector
+import character_picker
 from guardrails import ResourceGuard
 from engine import (
     run_chunked_pipeline, load_config, prepare_run, chunk_plan, chunk_dir_for, probe_video,
@@ -101,6 +102,8 @@ JOB_FIELD_VARS = {
         "trim_start": "vr_trim_start_var", "trim_end": "vr_trim_end_var",
         "fps": "vr_fps_var", "keep_temp": "vr_keep_temp_var", "resume": "vr_resume_var",
         "refresh_faces": "vr_refresh_faces_var",
+        "source_2": "vr_source2_var", "character_1": "vr_char1_var",
+        "character_2": "vr_char2_var",
     },
     "normal": {
         "preset": "nm_preset_var", "source": "nm_source_var", "target": "nm_target_var",
@@ -108,6 +111,8 @@ JOB_FIELD_VARS = {
         "trim_start": "nm_trim_start_var", "trim_end": "nm_trim_end_var",
         "fps": "nm_fps_var", "keep_temp": "nm_keep_temp_var",
         "refresh_faces": "nm_refresh_faces_var",
+        "source_2": "nm_source2_var", "character_1": "nm_char1_var",
+        "character_2": "nm_char2_var",
     },
     "upscale": {
         "input": "up_input_var", "output": "up_output_var",
@@ -115,6 +120,7 @@ JOB_FIELD_VARS = {
         "target": "up_target_var", "layout": "up_layout_var", "method": "up_method_var",
         "headset": "up_headset_var", "encoder": "up_encoder_var",
         "split_eyes": "up_split_eyes_var", "allow_sw": "up_allow_sw_var",
+        "interpolate": "up_interp_var",
     },
 }
 
@@ -299,6 +305,8 @@ SESSION_VARS = (
     "nm_preset_var", "nm_source_var", "nm_target_var", "nm_output_var",
     "nm_trim_start_var", "nm_trim_end_var", "nm_fps_var", "nm_keep_temp_var",
     "nm_schedule_var",
+    "vr_source2_var", "vr_char1_var", "vr_char2_var",
+    "nm_source2_var", "nm_char1_var", "nm_char2_var",
     "up_input_var", "up_output_var", "up_trim_start_var", "up_trim_end_var",
     "up_target_var", "up_layout_var", "up_method_var", "up_headset_var",
     "up_encoder_var", "up_split_eyes_var", "up_allow_sw_var", "up_schedule_var",
@@ -351,6 +359,7 @@ SLIDER_RANGES = {
     "face_tracker_score": (0.0, 0.5, 2),
     "target_frame_amount": (0, 5, 0),
     "reference_face_distance": (0.0, 1.0, 2),
+    "character_match_distance": (0.3, 1.0, 2),
     "quality": (50, 100, 0),
     # Each in-flight frame carries its own model working set, so this
     # multiplies VRAM. The guard clamps it further.
@@ -635,6 +644,8 @@ class App(ctk.CTk):
                         font=ctk.CTkFont(size=10), checkbox_width=16, checkbox_height=16,
                         width=90).grid(row=row, column=2, sticky="w", padx=(5, 0))
 
+        row = self._build_face_rows(tab, row + 1, "vr", pad_x, pad_y)
+
         row += 1
         ctk.CTkLabel(tab, text="Target VR Video", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
@@ -831,6 +842,8 @@ class App(ctk.CTk):
                         font=ctk.CTkFont(size=10), checkbox_width=16, checkbox_height=16,
                         width=90).grid(row=row, column=2, sticky="w", padx=(5, 0))
 
+        row = self._build_face_rows(tab, row + 1, "nm", pad_x, pad_y)
+
         row += 1
         ctk.CTkLabel(tab, text="Target Video", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
@@ -993,10 +1006,13 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab, text="Target Size", font=ctk.CTkFont(weight="bold")).grid(
             row=row, column=0, sticky="w", padx=pad_x, pady=pad_y)
         self.up_target_var = ctk.StringVar(value="8k")
-        ctk.CTkComboBox(tab, values=list(upscale_vr.TARGETS), width=140, state="readonly",
-                        variable=self.up_target_var,
+        ctk.CTkComboBox(tab, values=["source"] + list(upscale_vr.TARGETS), width=140,
+                        state="readonly", variable=self.up_target_var,
                         command=self.refresh_upscale_preview).grid(
             row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkLabel(tab, text="source keeps the size - use it to change only the frame rate",
+                     font=ctk.CTkFont(size=10), text_color="gray").grid(
+            row=row, column=3, sticky="w", padx=(5, 0), pady=pad_y)
 
         row += 1
         ctk.CTkLabel(tab, text="Layout", font=ctk.CTkFont(weight="bold")).grid(
@@ -1019,6 +1035,19 @@ class App(ctk.CTk):
                         command=self.refresh_upscale_preview).grid(
             row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
         ctk.CTkLabel(tab, text="esrgan is real super-resolution and is ~300x slower",
+                     font=ctk.CTkFont(size=10), text_color="gray").grid(
+            row=row, column=3, sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
+        ctk.CTkLabel(tab, text="Frame Rate", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y)
+        self.up_interp_var = ctk.StringVar(value="off")
+        ctk.CTkComboBox(tab, values=["off", "2x", "3x", "4x"], width=140,
+                        state="readonly", variable=self.up_interp_var,
+                        command=self.refresh_upscale_preview).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkLabel(tab, text="RIFE interpolation, e.g. 4x takes 30 fps to 120. Slow - "
+                               "see the estimate below",
                      font=ctk.CTkFont(size=10), text_color="gray").grid(
             row=row, column=3, sticky="w", padx=(5, 0), pady=pad_y)
 
@@ -1161,6 +1190,10 @@ class App(ctk.CTk):
             quality=int(fields.get("quality") or 95),
             allow_software=bool(fields.get("allow_sw")),
             split_eyes=bool(fields.get("split_eyes")),
+            # "off" / "2x".."4x" in the tab; jobs queued before this existed
+            # have no field and mean off.
+            interpolate=int(str(fields.get("interpolate") or "off").rstrip("x")
+                            .replace("off", "1") or 1),
             trim_start=self.parse_optional_float(fields.get("trim_start") or ""),
             trim_end=self.parse_optional_float(fields.get("trim_end") or ""),
             keep_temp=False,
@@ -1226,9 +1259,11 @@ class App(ctk.CTk):
                 ("Face Tracker", "face_tracker_score", "slider", None),
                 ("Tracker Window (frames)", "target_frame_amount", "slider", None),
             ]),
-            # 'one' replaces a single face per frame - the first one left after
-            # Order sorts them and Gender filters them. 'many' replaces every
-            # face in shot, bystanders and detector mistakes included.
+            # 'one' replaces one character (two with a Second Face): each face
+            # locks onto a person - the one picked with Pick Characters, or else
+            # the first left after Order sorts and Gender filters - and follows
+            # that person by identity. 'many' replaces every face in shot,
+            # bystanders and detector mistakes included.
             ("Face Selection", [
                 ("Mode", "selector_mode", "combobox",
                  ["one", "many", "reference"]),
@@ -1240,6 +1275,10 @@ class App(ctk.CTk):
                 # ambiguous or the classifier gets it wrong.
                 ("Gender", "selector_gender", "combobox",
                  ["auto", "female", "male"]),
+                # 'one' only: how close a face must be to a character's
+                # reference to count as that character. Lower if a lookalike
+                # gets swapped; higher if the swap drops out on turned heads.
+                ("Character Match", "character_match_distance", "slider", None),
                 # 'reference' only: how close a face has to be to the reference
                 # embedding to count as the same person, and which frame the
                 # reference is taken from. Ignored by 'one' and 'many'.
@@ -2189,6 +2228,21 @@ class App(ctk.CTk):
                 return None
             if self.check_source(fields["source"]) is None:
                 return None
+            if fields.get("source_2"):
+                if self.check_source(fields["source_2"]) is None:
+                    return None
+                if config.get("selector_mode", "one") != "one":
+                    messagebox.showerror(
+                        "Second Face",
+                        "A second face needs Face Selection mode 'one' (Settings tab). "
+                        "'many' and 'reference' give every face the same source.")
+                    return None
+            # Per job, not per Settings: the second face and who each face
+            # follows belong to this target, so they travel in the job's own
+            # config copy and never land in pipeline_config.json.
+            config["face_2_source"] = fields.get("source_2") or ""
+            config["character_1_ref"] = fields.get("character_1") or ""
+            config["character_2_ref"] = (fields.get("character_2") or "") if fields.get("source_2") else ""
             if not os.path.exists(fields["target"]):
                 messagebox.showerror("Error", f"Target video not found: {fields['target']}")
                 return None
@@ -2232,6 +2286,13 @@ class App(ctk.CTk):
         missing = [p for p in split_sources(f["source"]) if not os.path.exists(p)]
         if missing:
             return f"Source face not found: {missing[0]}"
+        missing = [p for p in split_sources(f.get("source_2") or "") if not os.path.exists(p)]
+        if missing:
+            return f"Second face not found: {missing[0]}"
+        missing = [p for key in ("character_1", "character_2")
+                   for p in split_sources(f.get(key) or "") if not os.path.exists(p)]
+        if missing:
+            return f"Character reference not found: {missing[0]} - pick the characters again"
         if not os.path.exists(f["target"]):
             return f"Target video not found: {f['target']}"
         return None
@@ -2245,8 +2306,13 @@ class App(ctk.CTk):
         when = job_not_before(job)
         self.log(f"[Queue] Added job {len(self.queue)}: {job_title(job)}"
                  + (f", not before {when.strftime('%a %d %b %H:%M')}" if when else "")
-                 + ". Press Start Queue on the Queue tab when the list is ready"
-                 + (" - or leave it, the queue is running." if self.queue_active else "."))
+                 + (". The queue is running - it is picked up in turn."
+                    if self.queue_active else ". Starting the queue."))
+        # A waiting list that never started on its own was the complaint. An
+        # idle queue is armed the moment a job lands on it; one already running
+        # picks the new job up in turn. A start time is still honoured - the
+        # queue tick holds a timed job until it is due.
+        self._arm_queue()
 
     def _enqueue(self, job):
         taken = self._output_taken(job)
@@ -2332,6 +2398,8 @@ class App(ctk.CTk):
             self.log(f"Quality preset: {f['preset']}")
             self.log(self.check_source(f["source"]) or "")
             self.log(f"Source: {f['source']}")
+            if f.get("source_2"):
+                self.log(f"Second face: {f['source_2']}")
             self.log(f"Target: {f['target']}")
             if is_vr:
                 self.log(f"Layout: {f['layout'].upper()}")
@@ -2573,6 +2641,23 @@ class App(ctk.CTk):
         self.refresh_queue_view()
 
     # -- the queue itself --------------------------------------------------------
+
+    def _arm_queue(self):
+        """
+        Start the queue if it is idle and something is waiting on it.
+
+        The single entry point for "a waiting job should run itself": a job
+        added to the queue, and a queue restored from last session. Safe to call
+        any time - it no-ops when the queue is already running, and skips the
+        empty "nothing is waiting" dialog start_queue would otherwise show. It
+        deliberately does not bail while a one-off Run is in flight: arming
+        mid-run is exactly how a job added during that run is picked up the
+        moment it finishes (see _after_teardown).
+        """
+        if self.queue_active:
+            return
+        if any(job["status"] == "waiting" for job in self.queue):
+            self.start_queue()
 
     def start_queue(self):
         if self.queue_active:
@@ -2829,8 +2914,14 @@ class App(ctk.CTk):
 
     def load_queue(self):
         """
-        Bring back last session's list. Never auto-starts: a machine that
-        rebooted overnight should not begin rendering the moment the app opens.
+        Bring back last session's list and arm it.
+
+        A waiting job restarts on its own: once the window is up, a restored
+        queue with anything waiting is started automatically, the same as one
+        armed by hand. Jobs with a start time still wait for it. The arming is
+        deferred to a later idle turn (see below) so it never fires inside app
+        construction and so the restore and machine-limit lines are logged
+        first.
         """
         try:
             with open(QUEUE_PATH) as handle:
@@ -2854,13 +2945,19 @@ class App(ctk.CTk):
         if jobs:
             self.log(f"[Queue] Restored {len(jobs)} job(s) from "
                      f"{data.get('saved', 'an earlier session')}"
-                     + (f"; {len(waiting)} still waiting. Open the Queue tab and press "
-                        f"Start Queue to run them." if waiting else "."))
+                     + (f"; {len(waiting)} still waiting - the queue starts them "
+                        f"automatically." if waiting else "."))
             now = datetime.now()
             overdue = [j for j in waiting if job_not_before(j) and job_not_before(j) < now]
             if overdue:
                 self.log(f"[Queue] {len(overdue)} of them had a start time that has "
-                         f"already passed - they run as soon as the queue is started.")
+                         f"already passed - they run as soon as the queue starts.")
+        if waiting:
+            # __init__ is still running here and the window is not shown yet.
+            # Arm on a later idle turn so the first render does not fire inside
+            # construction, and so the restore and machine-limit lines are in
+            # the log before the queue's own "Started" line.
+            self.after(1500, self._arm_queue)
 
     def log_resume_state(self):
         """
@@ -3124,6 +3221,104 @@ class App(ctk.CTk):
         )
         if path:
             self.vr_output_var.set(path)
+
+    def _build_face_rows(self, tab, row, prefix, pad_x, pad_y):
+        """
+        Second Face and Characters rows, the same on the VR and Normal tabs.
+
+        Returns the row the caller carries on from (the last one used).
+        """
+        source2_var = ctk.StringVar()
+        char1_var = ctk.StringVar()
+        char2_var = ctk.StringVar()
+        setattr(self, f"{prefix}_source2_var", source2_var)
+        setattr(self, f"{prefix}_char1_var", char1_var)
+        setattr(self, f"{prefix}_char2_var", char2_var)
+
+        ctk.CTkLabel(tab, text="Second Face", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
+        )
+        # No placeholder text: CTkEntry does not show one when it has a
+        # textvariable, so the hint sits beside it instead.
+        ctk.CTkEntry(tab, textvariable=source2_var, width=350).grid(
+            row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkButton(tab, text="Browse", width=70,
+                      command=lambda: self._browse_second_face(source2_var)).grid(
+            row=row, column=2, padx=(5, 0), pady=pad_y)
+        ctk.CTkLabel(tab, text="Optional - a second person, for a second character.",
+                     font=ctk.CTkFont(size=10), text_color="gray").grid(
+            row=row, column=3, sticky="w", padx=(5, 0), pady=pad_y)
+
+        row += 1
+        ctk.CTkLabel(tab, text="Characters", font=ctk.CTkFont(weight="bold")).grid(
+            row=row, column=0, sticky="w", padx=pad_x, pady=pad_y
+        )
+        summary = ctk.CTkLabel(tab, text="", font=ctk.CTkFont(size=11), anchor="w",
+                               text_color="#5a9bd5")
+        summary.grid(row=row, column=1, sticky="w", padx=pad_x, pady=pad_y)
+        ctk.CTkButton(tab, text="Pick", width=70,
+                      command=lambda: self._pick_characters(prefix)).grid(
+            row=row, column=2, padx=(5, 0), pady=pad_y)
+        ctk.CTkButton(tab, text="Clear", width=60, fg_color="#444444", hover_color="#555555",
+                      command=lambda: (char1_var.set(""), char2_var.set(""))).grid(
+            row=row, column=3, sticky="w", padx=(5, 0), pady=pad_y)
+
+        def sync(*_args):
+            parts = []
+            faces = [(1, char1_var)] + ([(2, char2_var)] if source2_var.get().strip() else [])
+            for number, var in faces:
+                picked = split_sources(var.get())
+                parts.append(f"Face {number}: " + (f"picked ({len(picked)} view(s))" if picked
+                                                   else "auto - largest face of its gender"))
+            summary.configure(text="   |   ".join(parts))
+        for var in (source2_var, char1_var, char2_var):
+            var.trace_add("write", sync)
+        sync()
+        return row
+
+    def _browse_second_face(self, var):
+        paths = filedialog.askopenfilenames(
+            title="Select Second Face - the person for the second character",
+            filetypes=self.SOURCE_FILETYPES
+        )
+        if paths:
+            var.set("; ".join(paths))
+
+    def _pick_characters(self, prefix):
+        """Scan the target for the people in it and tie Face 1 / Face 2 to one each."""
+        target = getattr(self, f"{prefix}_target_var").get().strip()
+        if not target or not os.path.exists(target):
+            messagebox.showinfo("Pick a video first",
+                                "Choose the target video first - the people are picked from it.")
+            return
+        if is_image_path(target):
+            messagebox.showinfo("Still image",
+                                "Picking characters works on a video target. For a still, "
+                                "the swap takes the largest face of the source's gender.")
+            return
+        if self._active_job is not None and not messagebox.askyesno(
+                "A job is running",
+                "The scan uses the GPU alongside the running job, which can slow it or "
+                "run it short of video memory. Scan anyway?"):
+            return
+        self.apply_settings()
+        two_faces = bool(getattr(self, f"{prefix}_source2_var").get().strip())
+        char_vars = {1: getattr(self, f"{prefix}_char1_var"),
+                     2: getattr(self, f"{prefix}_char2_var")}
+        picks = character_picker.pick_characters(
+            self, target, self.config,
+            layout=self.vr_layout_var.get() if prefix == "vr" else None,
+            start=self.parse_optional_float(getattr(self, f"{prefix}_trim_start_var").get()),
+            end=self.parse_optional_float(getattr(self, f"{prefix}_trim_end_var").get()),
+            two_faces=two_faces,
+            current={face: var.get() for face, var in char_vars.items()},
+        )
+        if picks is None:
+            return
+        for face, refs in picks.items():
+            char_vars[face].set("; ".join(refs))
+            self.log(f"[Characters] Face {face} will follow the picked person "
+                     f"({len(refs)} reference view(s)).")
 
     def browse_nm_source(self):
         paths = filedialog.askopenfilenames(

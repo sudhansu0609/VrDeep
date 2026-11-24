@@ -23,3 +23,9 @@ __pycache__/
 # The RIFE frame-interpolation weights. 10 MB of downloadable model, not source
 # - scripts/rife_worker.py fetches them on demand (see --install-model).
 /models/
+
+# The setup wizard's marker and log (scripts/app_installer, see installer/README.md
+# in the template repo). facefusion/venv is already covered by /facefusion/ above.
+/installer/installed.json
+/logs/
+installer/setup.running

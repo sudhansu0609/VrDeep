@@ -39,6 +39,15 @@ video path was written for 1080p frames that are 1/16th of that.
      swap gets faster; what changes is that there is now a machine left over to
      run a split, a merge or a second lane alongside it.
 
+  4. Character slots (face_selector.py, face_swapper/core.py, plus the new
+     module facefusion/vrdeep_slots.py copied from scripts/facefusion_addons).
+     Upstream 'one' mode takes the largest face in each frame on its own, so
+     with two people on screen the swap hops between them; and every selected
+     face gets the same source, so two characters cannot get two faces. The
+     module ties Face 1 / Face 2 to one character each by identity. It only
+     switches on when engine.run_facefusion sets VRDEEP_FACE_SLOTS, so a
+     plain FaceFusion run is unchanged.
+
 Usage:
     python scripts/patch_facefusion.py            apply (idempotent)
     python scripts/patch_facefusion.py --check    report status, change nothing
@@ -196,6 +205,66 @@ def create_inference_session(model_path : str, inference_providers : List[Infere
 \t\tinference_session = InferenceSession(model_path, sess_options = session_options, providers = inference_providers)
 """
 
+SELECTOR_IMPORT_OLD = """from facefusion.face_tracker import track_faces
+"""
+
+SELECTOR_IMPORT_NEW = """from facefusion.face_tracker import track_faces
+# VrDeep: character slots - see vrdeep_slots.py.
+from facefusion import vrdeep_slots
+"""
+
+SELECTOR_OLD = """def select_faces(reference_vision_frame : VisionFrame, source_vision_frames : List[VisionFrame], target_vision_frames : List[VisionFrame]) -> List[Face]:
+\tsource_faces = get_static_faces(source_vision_frames)
+"""
+
+SELECTOR_NEW = """def select_faces(reference_vision_frame : VisionFrame, source_vision_frames : List[VisionFrame], target_vision_frames : List[VisionFrame]) -> List[Face]:
+\t# VrDeep: with character slots active, the faces every processor works on
+\t# are exactly the characters the slots are following - so the enhancer and
+\t# the expression restorer leave everybody else alone too.
+\tif vrdeep_slots.is_active():
+\t\treturn [ target_face for _, target_face in vrdeep_slots.select_slot_faces(target_vision_frames) ]
+
+\tsource_faces = get_static_faces(source_vision_frames)
+"""
+
+SWAPPER_IMPORT_OLD = """from facefusion.face_selector import select_faces, sort_faces_by_order
+"""
+
+SWAPPER_IMPORT_NEW = """from facefusion.face_selector import select_faces, sort_faces_by_order
+# VrDeep: character slots - see vrdeep_slots.py.
+from facefusion import vrdeep_slots
+"""
+
+SWAPPER_OLD = """\ttarget_vision_frame = get_middle(target_vision_frames)
+\tsource_face = extract_source_face(source_vision_frames)
+\ttarget_faces = select_faces(reference_vision_frame, source_vision_frames, target_vision_frames)
+"""
+
+SWAPPER_NEW = """\ttarget_vision_frame = get_middle(target_vision_frames)
+
+\t# VrDeep: each character gets its own slot's source face, instead of every
+\t# selected face getting the one averaged source.
+\tif vrdeep_slots.is_active():
+\t\tfor slot_index, target_face in vrdeep_slots.select_slot_faces(target_vision_frames):
+\t\t\tslot_source_face, slot_source_frame = vrdeep_slots.get_slot_source(slot_index)
+
+\t\t\tif slot_source_face:
+\t\t\t\ttarget_face = scale_face(target_face, target_vision_frame, temp_vision_frame)
+\t\t\t\ttemp_vision_frame = swap_face(slot_source_face, target_face, slot_source_frame, temp_vision_frame)
+\t\treturn temp_vision_frame, temp_vision_mask
+
+\tsource_face = extract_source_face(source_vision_frames)
+\ttarget_faces = select_faces(reference_vision_frame, source_vision_frames, target_vision_frames)
+"""
+
+# Whole new files, copied in rather than rewritten from a snippet. The source
+# of truth is the copy under scripts/, which git tracks.
+ADDONS = [
+    (os.path.join(PROJECT_DIR, "scripts", "facefusion_addons", "vrdeep_slots.py"),
+     os.path.join(FACEFUSION_DIR, "facefusion", "vrdeep_slots.py"),
+     "character slots module installed"),
+]
+
 PATCHES = [
     (os.path.join(FACEFUSION_DIR, "facefusion", "ffmpeg.py"),
      "capped ffmpeg reader decode threads", READER_OLD, READER_NEW),
@@ -205,7 +274,22 @@ PATCHES = [
      "onnxruntime imported for session options", IMPORT_OLD, IMPORT_NEW),
     (os.path.join(FACEFUSION_DIR, "facefusion", "inference_manager.py"),
      "bounded onnxruntime thread pools", SESSION_OLD, SESSION_NEW),
+    (os.path.join(FACEFUSION_DIR, "facefusion", "face_selector.py"),
+     "character slots imported by the face selector", SELECTOR_IMPORT_OLD, SELECTOR_IMPORT_NEW),
+    (os.path.join(FACEFUSION_DIR, "facefusion", "face_selector.py"),
+     "face selector follows the slot characters", SELECTOR_OLD, SELECTOR_NEW),
+    (os.path.join(FACEFUSION_DIR, "facefusion", "processors", "modules", "face_swapper", "core.py"),
+     "character slots imported by the face swapper", SWAPPER_IMPORT_OLD, SWAPPER_IMPORT_NEW),
+    (os.path.join(FACEFUSION_DIR, "facefusion", "processors", "modules", "face_swapper", "core.py"),
+     "face swapper gives each character its own source", SWAPPER_OLD, SWAPPER_NEW),
 ]
+
+
+def _read(path):
+    try:
+        return io.open(path, encoding="utf-8").read()
+    except OSError:
+        return None
 
 
 def status():
@@ -225,6 +309,14 @@ def status():
             # Neither form present: upstream changed underneath us, and blindly
             # rewriting would be worse than leaving it alone.
             broken.append(f"{label} (source no longer matches; needs re-doing by hand)")
+    for source, target, label in ADDONS:
+        wanted = _read(source)
+        if wanted is None:
+            broken.append(f"{label} ({source} not found)")
+        elif _read(target) == wanted:
+            applied.append(label)
+        else:
+            missing.append(label)
     return applied, missing, broken
 
 
@@ -237,6 +329,12 @@ def apply():
         if old not in text:
             continue
         io.open(path, "w", encoding="utf-8", newline="").write(text.replace(old, new, 1))
+        changed.append(label)
+    for source, target, label in ADDONS:
+        wanted = _read(source)
+        if wanted is None or _read(target) == wanted:
+            continue
+        io.open(target, "w", encoding="utf-8", newline="").write(wanted)
         changed.append(label)
     return changed
 

@@ -91,9 +91,13 @@ DEFAULT_CONFIG = {
     # 85% buys landmarks 2dfan4 cannot find.
     "landmarker_model": "2dfan4",
     "landmarker_score": 0.5,
-    # 'one' swaps a single face per frame. 'many' replaces every face in frame,
-    # including bystanders and anything the detector got wrong; 'reference'
-    # matches a specific face by embedding.
+    # 'one' swaps one character: it locks onto a person (the one picked in the
+    # app's character picker, or else the largest face of the source's gender
+    # on the first frame) and follows that person by identity for the whole
+    # video - see face_slot_spec. It also enables a second source face for a
+    # second character. 'many' replaces every face in frame, including
+    # bystanders and anything the detector got wrong; 'reference' is
+    # FaceFusion's own match against one frame of the target.
     "selector_mode": "one",
     # Which face 'one' picks: largest in frame by default.
     "selector_order": "large-small",
@@ -104,6 +108,12 @@ DEFAULT_CONFIG = {
     # reference is taken from.
     "reference_face_distance": 0.3,
     "reference_frame_number": 0,
+    # How close (1 - cosine of the ArcFace embeddings) a face has to be to a
+    # character's reference to count as that character. The same person across
+    # poses typically sits at 0.3-0.6 and two different people at 0.8 or more,
+    # so 0.65 keeps turned heads while leaving bystanders alone. Lower it if a
+    # lookalike gets swapped; raise it if the swap drops out on profiles.
+    "character_match_distance": 0.65,
     # Recovers frames the detector drops. At 0 - the FaceFusion default, and
     # what this pipeline used to run - a frame with no detection is simply left
     # unswapped, so the original face flashes back for one frame. Above 0,
@@ -823,6 +833,122 @@ def resolve_source_faces(source, config, log_cb=None, progress_cb=None, guard=No
     return resolved
 
 
+CHARACTERS_DIR = os.path.join(PROJECT_DIR, "output", "characters")
+
+
+def resolve_face_slots(config, target_video, log_cb=None, progress_cb=None, guard=None,
+                       refresh=False):
+    """
+    The run's config with the second face resolved and the character lock named.
+
+    Face 1 is the ordinary Source Face. Face 2 (config 'face_2_source') is an
+    optional second person for a second character; like Face 1 it may be photos
+    or a clip, and a clip is turned into stills here, once per run, so both eyes
+    and every chunk swap against the same identity. Each face follows one
+    character - the one picked for it ('character_1_ref' / 'character_2_ref',
+    crops saved by the app's character picker), or else whichever the swap
+    locks onto first. That lock is written to a file named after the target and
+    the faces, so the other eye and the later chunks follow the same people
+    rather than each picking their own.
+    """
+    config = dict(config)
+    face_2 = split_sources(config.get("face_2_source") or "")
+    mode = config.get("selector_mode", "one")
+    if face_2 and mode != "one":
+        raise PipelineError(
+            f"A second face needs Face Selector mode 'one' (Settings tab); it is '{mode}'.\n\n"
+            f"'many' and 'reference' give every selected face the same source, so there "
+            f"is no way to tell which character should get which face.")
+
+    face_2_images = []
+    if face_2:
+        if log_cb:
+            log_cb(f"[Source] Face 2: {'; '.join(face_2)}")
+        # The Settings gender filter describes Face 1. Face 2 is filtered by its
+        # own source instead, or a female Face 2 clip would be thrown away by a
+        # 'male' setting meant for Face 1.
+        face_2_images = resolve_source_faces(
+            face_2, dict(config, selector_gender="auto"), log_cb=log_cb,
+            progress_cb=progress_cb, guard=guard, refresh=refresh,
+        )
+    config["face_2_images"] = face_2_images
+
+    refs = [split_sources(config.get("character_1_ref") or "")]
+    if face_2_images:
+        refs.append(split_sources(config.get("character_2_ref") or ""))
+    missing = [p for group in refs for p in group if not os.path.exists(p)]
+    if missing:
+        raise PipelineError(f"Character reference not found: {missing[0]}\n\n"
+                            f"Pick the characters again, or clear them to let the swap choose.")
+    # Paths alone would not notice a reference or a Face 2 still being redone
+    # in place, and both decide what the swap produces.
+    config["face_slot_stamps"] = ([_path_stamp(p) for p in face_2_images]
+                                  + [_path_stamp(p) for group in refs for p in group])
+
+    if mode == "one" and not all(refs):
+        lock_key = _stage_key(
+            target=_path_stamp(target_video),
+            face_1=config.get("source_face_stamps"),
+            face_2=[_path_stamp(p) for p in face_2_images],
+            refs=[[_path_stamp(p) for p in group] for group in refs],
+            gender=config.get("selector_gender"), order=config.get("selector_order"),
+        )
+        config["character_lock_file"] = os.path.join(CHARACTERS_DIR, "locks",
+                                                     f"lock_{lock_key}.json")
+    else:
+        config.pop("character_lock_file", None)
+
+    if log_cb and mode == "one":
+        for number, group in enumerate(refs, start=1):
+            if group:
+                log_cb(f"[Characters] Face {number} follows the picked character "
+                       f"({len(group)} reference crop(s)).")
+            else:
+                log_cb(f"[Characters] Face {number} will lock onto the "
+                       f"{'largest' if number == 1 else 'next largest'} face of its gender "
+                       f"and follow it. Use 'Pick Characters' to choose who instead.")
+    return config
+
+
+def face_slot_spec(source_paths, config):
+    """
+    The slot file the patched FaceFusion reads (VRDEEP_FACE_SLOTS), or None.
+
+    Active for selector mode 'one' - where it replaces upstream's "largest face
+    in this frame", which hops between characters - and carries the second face
+    when there is one. See scripts/facefusion_addons/vrdeep_slots.py.
+    """
+    face_2_images = config.get("face_2_images")
+    if face_2_images is None:
+        # Called without the pipeline having resolved it: photos only.
+        face_2_images = split_sources(config.get("face_2_source") or "")
+        videos = [p for p in face_2_images if is_video_path(p)]
+        if videos:
+            raise PipelineError(f"{os.path.basename(videos[0])} is a video; call "
+                                f"engine.resolve_face_slots(config, target) first.")
+    if config.get("selector_mode", "one") != "one":
+        if face_2_images:
+            raise PipelineError("A second face needs Face Selector mode 'one'.")
+        return None
+    slots = [{
+        "sources": list(source_paths),
+        "references": split_sources(config.get("character_1_ref") or ""),
+        "gender": config.get("selector_gender") or "auto",
+    }]
+    if face_2_images:
+        slots.append({
+            "sources": list(face_2_images),
+            "references": split_sources(config.get("character_2_ref") or ""),
+            "gender": "auto",
+        })
+    return {
+        "distance": float(config.get("character_match_distance", 0.65)),
+        "order": config.get("selector_order", "large-small"),
+        "lock_file": config.get("character_lock_file"),
+        "slots": slots,
+    }
+
+
 def run_facefusion(source_path, target_path, output_path, temp_path, config, log_cb=None,
                    progress_cb=None, start_pct=10, end_pct=90, stage_name="FaceFusion",
                    guard=None, guard_config=None, lane=None):
@@ -876,6 +1002,17 @@ def run_facefusion(source_path, target_path, output_path, temp_path, config, log
 
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
     os.makedirs(temp_path, exist_ok=True)
+
+    child_env = _cuda_child_env(guard_config)
+    slot_spec = face_slot_spec(src_list, config)
+    if slot_spec:
+        slot_path = os.path.join(temp_path, "face_slots.json")
+        with open(slot_path, "w", encoding="utf-8") as handle:
+            json.dump(slot_spec, handle, indent=2)
+        child_env["VRDEEP_FACE_SLOTS"] = slot_path
+        if log_cb:
+            log_cb(f"  Characters: {len(slot_spec['slots'])} face(s), each following one "
+                   f"character (match distance {slot_spec['distance']})")
 
     # Build processors list
     # Order is execution order. The expression has to be put back onto the
@@ -1000,7 +1137,7 @@ def run_facefusion(source_path, target_path, output_path, temp_path, config, log
         cmd.extend(["--output-image-quality", str(config["quality"])])
 
     proc = guard.spawn(
-        cmd, lane=lane, cwd=FACEFUSION_DIR, env=_cuda_child_env(guard_config),
+        cmd, lane=lane, cwd=FACEFUSION_DIR, env=child_env,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, errors="replace",
     )
@@ -1035,6 +1172,12 @@ def run_facefusion(source_path, target_path, output_path, temp_path, config, log
     for line in iter_lines(proc.stdout):
         if guard.abort_reason:
             break
+
+        # The character-slot module's own reports (who each face locked onto).
+        if line.startswith("VRDEEP_SLOT "):
+            if log_cb:
+                log_cb(f"  [{stage_name}] {line[len('VRDEEP_SLOT '):]}")
+            continue
 
         output_lines.append(line)
         # Keep only a tail; a long run emits hundreds of thousands of lines and
@@ -2901,6 +3044,12 @@ def run_vr_pipeline(source_face, target_video, output_path, config, layout="sbs"
             progress_cb=lambda p, t: clock.progress(int(p * clock.PRELUDE_PCT / 100.0), t),
             refresh=refresh_source_faces,
         )
+        config = resolve_face_slots(
+            dict(config, source_face_stamps=[_path_stamp(p) for p in source_face]),
+            target_video, log_cb=log_cb, guard=guard,
+            progress_cb=lambda p, t: clock.progress(int(p * clock.PRELUDE_PCT / 100.0), t),
+            refresh=refresh_source_faces,
+        )
 
         left_video = os.path.join(temp_dir, "left.mp4")
         right_video = os.path.join(temp_dir, "right.mp4")
@@ -3461,6 +3610,12 @@ def run_normal_pipeline(source_face, target_video, output_path, config, fps=None
         # clip with no usable face fails in seconds rather than after the trim.
         source_face = resolve_source_faces(
             source_face, config, log_cb=log_cb, guard=guard,
+            progress_cb=lambda p, t: clock.progress(int(p * clock.PRELUDE_PCT / 100.0), t),
+            refresh=refresh_source_faces,
+        )
+        config = resolve_face_slots(
+            dict(config, source_face_stamps=[_path_stamp(p) for p in source_face]),
+            target_video, log_cb=log_cb, guard=guard,
             progress_cb=lambda p, t: clock.progress(int(p * clock.PRELUDE_PCT / 100.0), t),
             refresh=refresh_source_faces,
         )

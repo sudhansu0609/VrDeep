@@ -1,0 +1,15 @@
+{
+  "id": "VrDeep",
+  "name": "VrDeep",
+  "description": "VR face-swap pipeline: FaceFusion swap, Real-ESRGAN/RIFE upscale, split/merge for stereoscopic video",
+  "version": "1.0.0",
+  "launch_target": "%WINDIR%\\System32\\wscript.exe",
+  "launch_args": "\"{root}\\launch_app.vbs\"",
+  "icon": "assets\\vrdeep.ico",
+  "setup_script": "installer\\setup_env.ps1",
+  "env_summary": "Python 3.13 + FaceFusion's CUDA onnxruntime, CUDA PyTorch (cu128, Blackwell); ~11 GB",
+  "estimated_mb": 11000,
+  "health_paths": [
+    "facefusion\\venv\\Scripts\\python.exe"
+  ]
+}

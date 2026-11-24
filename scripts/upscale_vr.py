@@ -74,7 +74,7 @@ import guardrails
 from guardrails import GuardAbort, ResourceGuard
 from engine import (
     FACEFUSION_DIR, PROJECT_DIR, PYTHON, PipelineError,
-    _encoder_args, apply_stereo_metadata, merge_videos, probe_video,
+    _encoder_args, apply_stereo_metadata, interpolate_video, merge_videos, probe_video,
     quality_to_cq, split_video,
 )
 
@@ -208,6 +208,23 @@ ESRGAN_MODELS = {
 # than a prediction, and the printed estimate says "at least" for that reason.
 ESRGAN_SEC_PER_INPUT_MP = 4.5
 
+# Frame interpolation (RIFE, scripts/rife_worker.py). The model's VRAM grows
+# with the frame it infers on: 8.7 GB at 3072x3072 and 15.8 GB at 4096x4096 on
+# this 16 GB card, where running out does not fail but drops the rate ~50x.
+# So the inference size is capped at 3072 on the long side and the synthesised
+# frames are scaled back up; original frames pass through untouched. Each eye
+# is interpolated on its own, as the deepfake pipeline does, because a merged
+# 8192x4096 frame would not fit at any useful inference size.
+INTERP_MAX_INFER_SIDE = 3072
+# End to end, measured: 0.96 synthesised frame/s at a 3072x3072 inference.
+INTERP_FRAMES_PER_SEC_AT_MAX = 0.96
+INTERP_CHOICES = (1, 2, 3, 4)
+# Intermediates (split eyes, interpolated eyes, merged pair) stay on NVENC at
+# cq 16 whatever the final encoder is: they are re-encoded once more by the
+# resize stage, which is where the chosen encoder and headset tuning apply.
+INTERP_INTERMEDIATE_ENCODER = "hevc_nvenc"
+INTERP_INTERMEDIATE_CRF = 16
+
 
 def log(message):
     print(message, flush=True)
@@ -329,6 +346,9 @@ def resolve_geometry(probe, layout, target, scale):
 
     if scale:
         factor = float(scale)
+    elif target == "source":
+        # Keep the size; used to change only the frame rate.
+        factor = 1.0
     elif target in TARGETS:
         # TARGETS holds the SBS packed width, which is two eyes wide.
         want_eye_w = TARGETS[target] / (1 if layout == "mono" else 2)
@@ -862,6 +882,85 @@ def estimate_neural_hours(geometry, layout, probe, duration):
     return frames * input_mp * ESRGAN_SEC_PER_INPUT_MP * eyes / 3600.0
 
 
+def interp_infer_scale(width, height):
+    """Inference scale for one RIFE frame of this size; see INTERP_MAX_INFER_SIDE."""
+    return max(0.25, min(1.0, INTERP_MAX_INFER_SIDE / float(max(width, height))))
+
+
+def estimate_interp_minutes(probe, layout, multi, duration):
+    """Rough wall-clock for the interpolation stage, from the measured rate."""
+    if multi <= 1:
+        return 0.0
+    eye_w, eye_h = eye_dimensions(probe["width"], probe["height"], layout)
+    scale = interp_infer_scale(eye_w, eye_h)
+    infer_px = (eye_w * scale) * (eye_h * scale)
+    rate = min(6.0, INTERP_FRAMES_PER_SEC_AT_MAX
+               * (INTERP_MAX_INFER_SIDE ** 2) / max(1.0, infer_px))
+    eyes = 1 if layout == "mono" else 2
+    synthesised = duration * (probe.get("fps") or 30.0) * (multi - 1) * eyes
+    return synthesised / rate / 60.0
+
+
+def interpolate_stage(input_path, layout, multi, trim_start, trim_end, guard,
+                      guard_config, temp_dir, progress_cb=None):
+    """
+    Raise the frame rate before any resize, and return the new file.
+
+    Runs first because RIFE's cost grows with the frame it works on: on the
+    source-size eyes it is already the slowest stage, after an upscale it would
+    not fit on the card. The trim is applied here, so the caller must not apply
+    it again to the file this returns.
+    """
+    say = lambda m: log(f"  {m}")
+    encoder = INTERP_INTERMEDIATE_ENCODER
+    crf = INTERP_INTERMEDIATE_CRF
+
+    def interp(src, dst, label, lo, hi):
+        eye = probe_video(src)
+        interpolate_video(src, dst, multi=multi,
+                          infer_scale=interp_infer_scale(eye["width"], eye["height"]),
+                          encoder=encoder, crf=crf, log_cb=say, guard=guard,
+                          progress_cb=progress_cb, guard_config=guard_config,
+                          stage_name=label, start_pct=lo, end_pct=hi)
+        return dst
+
+    if layout == "mono":
+        src = input_path
+        if trim_start is not None or trim_end is not None:
+            src = os.path.join(temp_dir, "trimmed.mp4")
+            cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats"]
+            if trim_start is not None:
+                cmd += ["-ss", str(trim_start)]
+            if trim_end is not None:
+                cmd += ["-to", str(trim_end)]
+            cmd += ["-i", input_path, "-map", "0:v:0", "-map", "0:a?"]
+            cmd += _encoder_args(encoder, crf, guard_config, preset="p6")
+            cmd += ["-c:a", "aac", "-b:a", "256k", src]
+            if run_ffmpeg_with_progress(cmd, guard, 0, None, "Trimming") != 0:
+                guard.check()
+                raise PipelineError("ffmpeg failed trimming the input before interpolation.")
+        out = interp(src, os.path.join(temp_dir, "interpolated.mp4"),
+                     "Interpolation", 0, 100)
+        if src != input_path:
+            os.remove(src)
+        return out
+
+    log("  Splitting eyes for interpolation...")
+    left, right = split_video(input_path, temp_dir, layout, trim_start=trim_start,
+                              trim_end=trim_end, log_cb=say, guard=guard,
+                              encoder=encoder, guard_config=guard_config)
+    left_i = interp(left, os.path.join(temp_dir, "left_interp.mp4"), "Left eye", 0, 45)
+    os.remove(left)
+    right_i = interp(right, os.path.join(temp_dir, "right_interp.mp4"), "Right eye", 45, 90)
+    os.remove(right)
+    merged = os.path.join(temp_dir, "interpolated.mp4")
+    merge_videos(left_i, right_i, merged, layout, encoder, crf, None, True, None, say,
+                 guard=guard, guard_config=guard_config)
+    os.remove(left_i)
+    os.remove(right_i)
+    return merged
+
+
 def trimmed_duration(path, trim_start=None, trim_end=None):
     """
     How much of `path` a run will actually touch, in seconds.
@@ -936,16 +1035,22 @@ def describe(args):
     finally:
         log = real_log
 
+    multi = int(getattr(args, "interpolate", 1) or 1)
+    out_fps = probe["fps"] * multi
+    if multi > 1:
+        lines.append(f"Frame rate: {probe['fps']:.4g} -> {out_fps:.4g} fps "
+                     f"(RIFE {multi}x, each eye on its own)")
+
     if args.headset:
         profile = HEADSETS[args.headset]
-        blocks, max_fps, fits = decoder_budget(args.headset, geometry, probe["fps"])
+        blocks, max_fps, fits = decoder_budget(args.headset, geometry, out_fps)
         lines.append(f"{profile['label']}: {blocks:,} of {profile['max_blocks']:,} blocks, "
                      f"up to {max_fps:.0f} fps at this size "
-                     f"(source is {probe['fps']:.4g})")
+                     f"(output is {out_fps:.4g})")
         if not fits:
             lines.append("WARNING: past this headset's decoder limit - it will not play.")
-        elif probe["fps"] > max_fps + 0.5:
-            lines.append(f"WARNING: {probe['fps']:.4g} fps is over the decoder's budget "
+        elif out_fps > max_fps + 0.5:
+            lines.append(f"WARNING: {out_fps:.4g} fps is over the decoder's budget "
                          f"at this size.")
 
         content = args.content or ("flat" if layout == "mono" else "vr180")
@@ -957,9 +1062,13 @@ def describe(args):
                        else "past what the panel can show")
             lines.append(f"Sampling ({content}): {ratio:.2f}x - {verdict}.")
 
-    frames = probe["fps"] * trimmed_duration(args.input, args.trim_start, args.trim_end)
+    seconds = trimmed_duration(args.input, args.trim_start, args.trim_end)
+    if multi > 1:
+        lines.append(f"Interpolation: roughly {estimate_interp_minutes(probe, layout, multi, seconds):.0f} "
+                     f"minutes, before the resize.")
+    frames = probe["fps"] * seconds * multi
     if args.method == "esrgan":
-        hours = estimate_neural_hours(geometry, layout, probe, frames / (probe["fps"] or 30))
+        hours = estimate_neural_hours(geometry, layout, dict(probe, fps=out_fps), seconds)
         lines.append(f"Estimated time: at least {hours:.1f} hours. A resize would take "
                      f"about {frames / 11 / 60:.1f} minutes.")
     elif frames:
@@ -1013,6 +1122,11 @@ def build_parser():
     parser.add_argument("--split-eyes", action="store_true",
                         help="Write one file per eye instead of a merged stereo file. "
                              "The only way to get 16K that still hardware-decodes.")
+    parser.add_argument("--interpolate", type=int, default=1, choices=INTERP_CHOICES,
+                        help="Multiply the frame rate with RIFE before resizing: 2 "
+                             "doubles it, 4 takes 30 fps to 120. Each eye is done on "
+                             "its own. Slow - see the estimate it prints. Use "
+                             "--target source to change only the frame rate.")
     parser.add_argument("--trim-start", type=float, default=None)
     parser.add_argument("--trim-end", type=float, default=None)
     parser.add_argument("--keep-temp", action="store_true")
@@ -1063,6 +1177,12 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
         return 1
 
     duration = trimmed_duration(args.input, args.trim_start, args.trim_end)
+    multi = int(getattr(args, "interpolate", 1) or 1)
+    if multi not in INTERP_CHOICES:
+        log(f"ERROR: --interpolate must be one of {', '.join(map(str, INTERP_CHOICES))}.")
+        return 1
+    # What the output will run at; the headset checks are about the output.
+    out_probe = dict(probe, fps=probe["fps"] * multi)
 
     log("=" * 68)
     log("VR UPSCALE")
@@ -1088,7 +1208,7 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
     if args.headset:
         log(f"  Headset    : {HEADSETS[args.headset]['label']}  ({args.content})")
         report_sampling(args.headset, args.content, geometry)
-        check_headset_limits(args.headset, geometry, probe)
+        check_headset_limits(args.headset, geometry, out_probe)
     try:
         encoder = check_encoder_ceiling(ceiling_geometry, args.encoder,
                                         args.allow_software, args.method)
@@ -1098,8 +1218,14 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
         log(f"Cannot do that:\n\n{exc}")
         return 1
 
+    if multi > 1:
+        log("")
+        log(f"  Frame rate : {probe['fps']:.4g} -> {out_probe['fps']:.4g} fps (RIFE {multi}x), "
+            f"roughly {estimate_interp_minutes(probe, args.layout, multi, duration):.0f} "
+            f"minutes before the resize")
+
     if args.method == "esrgan":
-        hours = estimate_neural_hours(geometry, args.layout, probe, duration)
+        hours = estimate_neural_hours(geometry, args.layout, out_probe, duration)
         log("")
         log(f"  Estimated time: at least {hours:.1f} hours "
             f"({'both eyes' if args.layout != 'mono' else 'whole frame'}), from the "
@@ -1132,6 +1258,17 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
     started = time.time()
     try:
         outputs = []
+        # Everything below reads from `source`. With interpolation on it is the
+        # interpolated file, which already has the trim applied.
+        source, trim_start, trim_end = args.input, args.trim_start, args.trim_end
+        if multi > 1:
+            log("")
+            source = interpolate_stage(args.input, args.layout, multi, trim_start,
+                                       trim_end, guard, guard_config, temp_dir,
+                                       progress_cb=progress_cb)
+            trim_start = trim_end = None
+            probe = probe_video(source)
+            log("")
         if args.split_eyes and args.layout != "mono":
             # Each eye becomes its own file. Nothing is stacked, so nothing has
             # to fit under the merged-frame ceiling.
@@ -1146,11 +1283,11 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
                 filtergraph = (f"[0:v]{crop_expr},scale={geometry['eye_w']}:"
                                f"{geometry['eye_h']}:flags={args.method}[v]")
                 cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats"]
-                if args.trim_start is not None:
-                    cmd += ["-ss", str(args.trim_start)]
-                if args.trim_end is not None:
-                    cmd += ["-to", str(args.trim_end)]
-                cmd += ["-i", args.input, "-filter_complex", filtergraph,
+                if trim_start is not None:
+                    cmd += ["-ss", str(trim_start)]
+                if trim_end is not None:
+                    cmd += ["-to", str(trim_end)]
+                cmd += ["-i", source, "-filter_complex", filtergraph,
                         "-map", "[v]", "-map", "0:a?"]
                 cmd += encoder_args_for(encoder, crf, guard_config, geo,
                                         headset=args.headset, probe=probe,
@@ -1170,16 +1307,16 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
                 outputs.append(path)
 
         elif args.method == "esrgan":
-            upscale_neural(args.input, args.output, geometry, args.layout, encoder,
+            upscale_neural(source, args.output, geometry, args.layout, encoder,
                            crf, args.quality, guard, guard_config, temp_dir,
                            args.keep_temp)
             outputs.append(args.output)
 
         else:
             log("")
-            upscale_resize(args.input, args.output, geometry, args.layout, encoder,
+            upscale_resize(source, args.output, geometry, args.layout, encoder,
                            crf, args.method, guard, guard_config,
-                           args.trim_start, args.trim_end,
+                           trim_start, trim_end,
                            headset=args.headset, probe=probe,
                            progress_cb=progress_cb,
                            total_frames=duration * (probe.get("fps") or 0))
@@ -1210,7 +1347,7 @@ def run_upscale(args, log_fn=None, progress_cb=None, guard=None):
     for path in outputs:
         size_gb = os.path.getsize(path) / 1e9
         log(f"  {path}  ({size_gb:.2f} GB)")
-    frames = duration * probe["fps"]
+    frames = duration * out_probe["fps"]
     log(f"  Done in {elapsed:.0f}s" + (f"  ({frames / elapsed:.2f} frame/s)" if elapsed else ""))
     log("=" * 68)
     return 0
